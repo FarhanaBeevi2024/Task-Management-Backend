@@ -1,5 +1,11 @@
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
+import {
+  canUserCreateProject,
+  shouldAutoAddAsProjectMemberOnCreate,
+  canAssignIssuesToOthers,
+  canManageProjectMembers,
+} from './accessConfig.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -40,14 +46,36 @@ const getUserRole = async (userId) => {
 };
 
 // ========== PROJECTS ==========
-// Use select('*') so projects load even when clients table doesn't exist yet
+// List projects: everyone (including superadmin) sees only projects they are in via project_members.
 router.get('/projects', verifyToken, async (req, res) => {
   try {
+    const { data: memberships, error: membershipsError } = await supabase
+      .from('project_members')
+      .select('project_id')
+      .eq('user_id', req.user.id);
+
+    if (membershipsError) throw membershipsError;
+
+    const projectIds = Array.from(
+      new Set(
+        (memberships || [])
+          .map((row) => row.project_id)
+          .filter((id) => id != null)
+      )
+    );
+
+    if (projectIds.length === 0) {
+      return res.json([]);
+    }
+
     const { data, error } = await supabase
       .from('projects')
       .select('*')
+      .in('id', projectIds)
       .order('created_at', { ascending: false });
+
     if (error) throw error;
+
     res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -56,8 +84,16 @@ router.get('/projects', verifyToken, async (req, res) => {
 
 router.post('/projects', verifyToken, async (req, res) => {
   try {
+    const userRole = await getUserRole(req.user.id);
+    const canCreate = canUserCreateProject(userRole);
+
+    // Only configured roles can create main projects
+    if (!canCreate) {
+      return res.status(403).json({ error: 'You are not allowed to create projects' });
+    }
+
     const { key, name, description, lead_id, client_id } = req.body;
-    const { data, error } = await supabase
+    const { data: project, error } = await supabase
       .from('projects')
       .insert([{
         key: key.toUpperCase(),
@@ -70,7 +106,26 @@ router.post('/projects', verifyToken, async (req, res) => {
       .select('*')
       .single();
     if (error) throw error;
-    res.status(201).json(data);
+
+    // Add creator as project member when config says so
+    if (shouldAutoAddAsProjectMemberOnCreate(userRole)) {
+      try {
+        await supabase
+          .from('project_members')
+          .upsert(
+            {
+              project_id: project.id,
+              user_id: req.user.id,
+              project_role: userRole,
+            },
+            { onConflict: 'project_id,user_id' }
+          );
+      } catch (membershipError) {
+        console.error('Failed to create project_members row', membershipError);
+      }
+    }
+
+    res.status(201).json(project);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -78,6 +133,15 @@ router.post('/projects', verifyToken, async (req, res) => {
 
 router.get('/projects/:id', verifyToken, async (req, res) => {
   try {
+    const { data: member, error: memberError } = await supabase
+      .from('project_members')
+      .select('project_id')
+      .eq('project_id', req.params.id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (memberError || !member) {
+      return res.status(404).json({ error: 'Project not found or access denied' });
+    }
     const { data, error } = await supabase
       .from('projects')
       .select('*')
@@ -85,6 +149,141 @@ router.get('/projects/:id', verifyToken, async (req, res) => {
       .single();
     if (error) throw error;
     res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.put('/projects/:id', verifyToken, async (req, res) => {
+  try {
+    const userRole = await getUserRole(req.user.id);
+    if (!canManageProjectMembers(userRole)) {
+      return res.status(403).json({ error: 'You do not have permission to update this project' });
+    }
+
+    const updates = {};
+    if (req.body.name !== undefined) updates.name = req.body.name;
+    if (req.body.description !== undefined) updates.description = req.body.description;
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    const { data, error } = await supabase
+      .from('projects')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Project members: list
+router.get('/projects/:id/members', verifyToken, async (req, res) => {
+  try {
+    const { data: memberships, error: membershipsError } = await supabase
+      .from('project_members')
+      .select('project_id, user_id, project_role')
+      .eq('project_id', req.params.id);
+
+    if (membershipsError) throw membershipsError;
+
+    if (!memberships || memberships.length === 0) {
+      return res.json([]);
+    }
+
+    const userIds = memberships.map((m) => m.user_id);
+
+    const [{ data: profiles, error: profilesError }, { data: roles, error: rolesError }] =
+      await Promise.all([
+        supabase
+          .from('profiles')
+          .select('id, email')
+          .in('id', userIds),
+        supabase
+          .from('user_roles')
+          .select('user_id, role')
+          .in('user_id', userIds),
+      ]);
+
+    if (profilesError) throw profilesError;
+    if (rolesError) throw rolesError;
+
+    const emailById = new Map((profiles || []).map((p) => [p.id, p.email]));
+    const globalRoleById = new Map((roles || []).map((r) => [r.user_id, r.role]));
+
+    const result = memberships.map((m) => ({
+      project_id: m.project_id,
+      user_id: m.user_id,
+      project_role: m.project_role,
+      email: emailById.get(m.user_id) || 'Unknown',
+      global_role: globalRoleById.get(m.user_id) || 'user',
+    }));
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Project members: add or update
+router.post('/projects/:id/members', verifyToken, async (req, res) => {
+  try {
+    const userRole = await getUserRole(req.user.id);
+    if (!canManageProjectMembers(userRole)) {
+      return res.status(403).json({ error: 'You do not have permission to manage project members' });
+    }
+
+    const { user_id, project_role } = req.body;
+    const allowedProjectRoles = ['superadmin', 'admin', 'team_leader', 'team_member', 'client', 'viewer'];
+
+    if (!user_id || !allowedProjectRoles.includes(project_role)) {
+      return res.status(400).json({ error: 'Invalid user or project_role' });
+    }
+
+    const { data, error } = await supabase
+      .from('project_members')
+      .upsert(
+        {
+          project_id: req.params.id,
+          user_id,
+          project_role,
+        },
+        { onConflict: 'project_id,user_id' }
+      )
+      .select('*')
+      .single();
+
+    if (error) throw error;
+
+    res.status(201).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Project members: remove
+router.delete('/projects/:id/members/:userId', verifyToken, async (req, res) => {
+  try {
+    const userRole = await getUserRole(req.user.id);
+    if (!canManageProjectMembers(userRole)) {
+      return res.status(403).json({ error: 'You do not have permission to manage project members' });
+    }
+
+    const { error } = await supabase
+      .from('project_members')
+      .delete()
+      .eq('project_id', req.params.id)
+      .eq('user_id', req.params.userId);
+
+    if (error) throw error;
+
+    res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -237,7 +436,6 @@ router.get('/issues/:id', verifyToken, async (req, res) => {
 router.post('/issues', verifyToken, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
-    
     const {
       project_id,
       issue_type_id,
@@ -260,10 +458,9 @@ router.post('/issues', verifyToken, async (req, res) => {
       exposed_to_client
     } = req.body;
     
-    // Permission checks
-    // Only team leaders can assign to others
-    if (assignee_id && assignee_id !== req.user.id && userRole !== 'team_leader') {
-      return res.status(403).json({ error: 'Only team leaders can assign issues to others' });
+    // Permission: only roles with canAssignIssuesToOthers can assign to others
+    if (assignee_id && assignee_id !== req.user.id && !canAssignIssuesToOthers(userRole)) {
+      return res.status(403).json({ error: 'You do not have permission to assign issues to others' });
     }
     
     // Use priority for backward compatibility, but prefer internal_priority
@@ -481,7 +678,7 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
       return res.json(issueWithUsers);
     }
     
-    // Team leaders can update everything (no parent_issue join to avoid schema-cache errors)
+    // Team leaders / admins / superadmins can update everything (no parent_issue join to avoid schema-cache errors)
     const priorityToLegacy = { P1: 'highest', P2: 'high', P3: 'medium', P4: 'low', P5: 'lowest' };
     const buildSafeUpdateBody = () => {
       const safe = {};

@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import jiraRouter from './jira_api.js';
+import { canManageUsers, canViewAllUsers } from './accessConfig.js';
 
 dotenv.config();
 
@@ -73,7 +74,7 @@ app.get('/api/tasks', verifyToken, async (req, res) => {
     if (userRole === 'user' || userRole === 'team_member') {
       query = query.or(`assigned_to.eq.${req.user.id},created_by.eq.${req.user.id}`);
     }
-    // Team leaders can see all tasks
+    // Team leaders, admins and superadmins can see all tasks
     
     const { data, error } = await query.order('created_at', { ascending: false });
     
@@ -115,9 +116,11 @@ app.post('/api/tasks', verifyToken, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     
-    // Only team leaders can assign tasks to others
-    if (req.body.assigned_to && req.body.assigned_to !== req.user.id && userRole !== 'team_leader') {
-      return res.status(403).json({ error: 'Only team leaders can assign tasks to others' });
+    const isManager = userRole === 'team_leader' || userRole === 'admin' || userRole === 'superadmin';
+
+    // Only managers can assign tasks to others
+    if (req.body.assigned_to && req.body.assigned_to !== req.user.id && !isManager) {
+      return res.status(403).json({ error: 'Only team leaders/admins can assign tasks to others' });
     }
     
     const taskData = {
@@ -153,6 +156,7 @@ app.put('/api/tasks/:id', verifyToken, async (req, res) => {
     if (taskError) throw taskError;
     
     const userRole = await getUserRole(req.user.id);
+    const isManager = userRole === 'team_leader' || userRole === 'admin' || userRole === 'superadmin';
     
     // Check permissions
     if (userRole === 'user') {
@@ -170,7 +174,7 @@ app.put('/api/tasks/:id', verifyToken, async (req, res) => {
         return res.status(403).json({ error: 'Team members cannot reassign tasks' });
       }
     }
-    // Team leaders can update anything
+    // Team leaders / admins / superadmins can update anything
     
     const { data, error } = await supabase
       .from('tasks')
@@ -198,9 +202,10 @@ app.delete('/api/tasks/:id', verifyToken, async (req, res) => {
     if (taskError) throw taskError;
     
     const userRole = await getUserRole(req.user.id);
+    const isManager = userRole === 'team_leader' || userRole === 'admin' || userRole === 'superadmin';
     
-    // Only creator or team leader can delete
-    if (task.created_by !== req.user.id && userRole !== 'team_leader') {
+    // Only creator or manager can delete
+    if (task.created_by !== req.user.id && !isManager) {
       return res.status(403).json({ error: 'Access denied' });
     }
     
@@ -230,42 +235,103 @@ app.get('/api/user', verifyToken, async (req, res) => {
   }
 });
 
-// Get all users (for team leaders to assign tasks)
+// Get all users (for task assignment or user management; gated by accessConfig)
 app.get('/api/users', verifyToken, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
-    
-    if (userRole !== 'team_leader') {
-      return res.status(403).json({ error: 'Only team leaders can view all users' });
+    if (!canViewAllUsers(userRole)) {
+      return res.status(403).json({ error: 'You do not have permission to view all users' });
     }
-    
-    // Get all users with their roles and profiles
-    const { data: userRoles, error: rolesError } = await supabase
-      .from('user_roles')
-      .select('user_id, role');
-    
-    if (rolesError) throw rolesError;
-    
-    // Get user emails from auth.users via profiles
-    const userIds = userRoles.map(ur => ur.user_id);
+
+    // 1) Load all profiles (one per auth user)
     const { data: profiles, error: profilesError } = await supabase
       .from('profiles')
-      .select('id, email')
-      .in('id', userIds);
+      .select('id, email');
     
     if (profilesError) throw profilesError;
+
+    const profileIds = profiles.map((p) => p.id);
+
+    // 2) Load roles only for those profile IDs (if some users don't have a row yet, they won't appear here)
+    const { data: userRoles, error: rolesError } = await supabase
+      .from('user_roles')
+      .select('user_id, role, is_active')
+      .in('user_id', profileIds);
     
-    // Combine data
-    const users = userRoles.map(ur => {
-      const profile = profiles.find(p => p.id === ur.user_id);
+    if (rolesError) throw rolesError;
+
+    const roleByUserId = new Map(userRoles.map((ur) => [ur.user_id, ur]));
+
+    // 3) Combine, defaulting missing roles to "user" and active=true
+    const users = profiles.map((p) => {
+      const ur = roleByUserId.get(p.id);
       return {
-        user_id: ur.user_id,
-        role: ur.role,
-        email: profile?.email || 'Unknown'
+        user_id: p.id,
+        email: p.email || 'Unknown',
+        role: ur?.role || 'user',
+        active: ur?.is_active !== false,
       };
     });
     
     res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ====== ADMIN: Manage user roles (gated by accessConfig) ======
+app.put('/api/admin/users/:userId/role', verifyToken, async (req, res) => {
+  try {
+    const currentUserRole = await getUserRole(req.user.id);
+    if (!canManageUsers(currentUserRole)) {
+      return res.status(403).json({ error: 'Only users with canManageUsers can change roles' });
+    }
+
+    const { role } = req.body;
+    const allowedRoles = ['user', 'team_member', 'team_leader', 'client', 'admin', 'superadmin'];
+
+    if (!allowedRoles.includes(role)) {
+      return res.status(400).json({ error: 'Invalid role value' });
+    }
+
+    const { data, error } = await supabase
+      .from('user_roles')
+      .upsert(
+        { user_id: req.params.userId, role },
+        { onConflict: 'user_id' }
+      )
+      .select('user_id, role')
+      .single();
+
+    if (error) throw error;
+
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ====== ADMIN: Activate/deactivate users (gated by accessConfig) ======
+app.put('/api/admin/users/:userId/active', verifyToken, async (req, res) => {
+  try {
+    const currentUserRole = await getUserRole(req.user.id);
+    if (!canManageUsers(currentUserRole)) {
+      return res.status(403).json({ error: 'Only users with canManageUsers can change user status' });
+    }
+
+    const { active } = req.body;
+    const value = active === false ? false : true;
+
+    const { data, error } = await supabase
+      .from('user_roles')
+      .update({ is_active: value })
+      .eq('user_id', req.params.userId)
+      .select('user_id, is_active')
+      .single();
+
+    if (error) throw error;
+
+    res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

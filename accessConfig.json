@@ -1,0 +1,88 @@
+{
+  "roles": {
+    "superadmin": {
+      "global": {
+        "canManageUsers": true,
+        "canViewAllUsers": true,
+        "canCreateProjects": true,
+        "canViewAllProjects": true
+      },
+      "project": {
+        "autoMemberOnCreate": true,
+        "canManageMembers": true,
+        "canCreateIssues": true,
+        "canAssignIssuesToOthers": true
+      }
+    },
+    "admin": {
+      "global": {
+        "canManageUsers": true,
+        "canViewAllUsers": true,
+        "canCreateProjects": false,
+        "canViewAllProjects": true
+      },
+      "project": {
+        "autoMemberOnCreate": true,
+        "canManageMembers": true,
+        "canCreateIssues": true,
+        "canAssignIssuesToOthers": true
+      }
+    },
+    "team_leader": {
+      "global": {
+        "canManageUsers": false,
+        "canViewAllUsers": true,
+        "canCreateProjects": false,
+        "canViewAllProjects": false
+      },
+      "project": {
+        "autoMemberOnCreate": false,
+        "canManageMembers": false,
+        "canCreateIssues": true,
+        "canAssignIssuesToOthers": true
+      }
+    },
+    "team_member": {
+      "global": {
+        "canManageUsers": false,
+        "canViewAllUsers": false,
+        "canCreateProjects": false,
+        "canViewAllProjects": false
+      },
+      "project": {
+        "autoMemberOnCreate": false,
+        "canManageMembers": false,
+        "canCreateIssues": true,
+        "canAssignIssuesToOthers": false
+      }
+    },
+    "client": {
+      "global": {
+        "canManageUsers": false,
+        "canViewAllUsers": false,
+        "canCreateProjects": false,
+        "canViewAllProjects": false
+      },
+      "project": {
+        "autoMemberOnCreate": false,
+        "canManageMembers": false,
+        "canCreateIssues": false,
+        "canAssignIssuesToOthers": false
+      }
+    },
+    "user": {
+      "global": {
+        "canManageUsers": false,
+        "canViewAllUsers": false,
+        "canCreateProjects": false,
+        "canViewAllProjects": false
+      },
+      "project": {
+        "autoMemberOnCreate": false,
+        "canManageMembers": false,
+        "canCreateIssues": true,
+        "canAssignIssuesToOthers": false
+      }
+    }
+  }
+}
