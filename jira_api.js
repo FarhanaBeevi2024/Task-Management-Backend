@@ -47,11 +47,12 @@ const getUserRole = async (userId) => {
 
 // ========== PROJECTS ==========
 // List projects: everyone (including superadmin) sees only projects they are in via project_members.
+// Each project includes current_user_project_role for the requesting user (e.g. for client column visibility).
 router.get('/projects', verifyToken, async (req, res) => {
   try {
     const { data: memberships, error: membershipsError } = await supabase
       .from('project_members')
-      .select('project_id')
+      .select('project_id, project_role')
       .eq('user_id', req.user.id);
 
     if (membershipsError) throw membershipsError;
@@ -62,6 +63,9 @@ router.get('/projects', verifyToken, async (req, res) => {
           .map((row) => row.project_id)
           .filter((id) => id != null)
       )
+    );
+    const projectRoleByProjectId = new Map(
+      (memberships || []).map((row) => [row.project_id, row.project_role])
     );
 
     if (projectIds.length === 0) {
@@ -76,7 +80,12 @@ router.get('/projects', verifyToken, async (req, res) => {
 
     if (error) throw error;
 
-    res.json(data);
+    const projectsWithRole = (data || []).map((p) => ({
+      ...p,
+      current_user_project_role: projectRoleByProjectId.get(p.id) || null,
+    }));
+
+    res.json(projectsWithRole);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -126,6 +135,25 @@ router.post('/projects', verifyToken, async (req, res) => {
     }
 
     res.status(201).json(project);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Current user's project role for this project (e.g. for client column visibility on board).
+router.get('/projects/:id/my-role', verifyToken, async (req, res) => {
+  try {
+    const { data: member, error } = await supabase
+      .from('project_members')
+      .select('project_role')
+      .eq('project_id', req.params.id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!member) {
+      return res.status(404).json({ error: 'Project not found or access denied' });
+    }
+    res.json({ project_role: member.project_role });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
