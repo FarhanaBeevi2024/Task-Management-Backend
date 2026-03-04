@@ -5,6 +5,7 @@ import {
   shouldAutoAddAsProjectMemberOnCreate,
   canAssignIssuesToOthers,
   canManageProjectMembers,
+  canManageMilestones,
 } from './accessConfig.js';
 import dotenv from 'dotenv';
 
@@ -317,6 +318,164 @@ router.delete('/projects/:id/members/:userId', verifyToken, async (req, res) => 
   }
 });
 
+// ========== MILESTONES ==========
+// List milestones for a project (any project member can view)
+router.get('/projects/:id/milestones', verifyToken, async (req, res) => {
+  try {
+    const { data: member } = await supabase
+      .from('project_members')
+      .select('project_id')
+      .eq('project_id', req.params.id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!member) {
+      return res.status(404).json({ error: 'Project not found or access denied' });
+    }
+
+    const { data, error } = await supabase
+      .from('milestones')
+      .select('*')
+      .eq('project_id', req.params.id)
+      .order('planned_date', { ascending: true, nullsFirst: false })
+      .order('version');
+
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create milestone (Admin, Team Leader, Superadmin only)
+router.post('/projects/:id/milestones', verifyToken, async (req, res) => {
+  try {
+    const userRole = await getUserRole(req.user.id);
+    if (!canManageMilestones(userRole)) {
+      return res.status(403).json({ error: 'You do not have permission to create or edit milestones' });
+    }
+
+    const { data: member } = await supabase
+      .from('project_members')
+      .select('project_id')
+      .eq('project_id', req.params.id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!member) {
+      return res.status(404).json({ error: 'Project not found or access denied' });
+    }
+
+    const { version, planned_date, status, description } = req.body;
+    if (!version || !version.trim()) {
+      return res.status(400).json({ error: 'Version is required' });
+    }
+
+    const { data, error } = await supabase
+      .from('milestones')
+      .insert([{
+        project_id: req.params.id,
+        version: version.trim(),
+        planned_date: planned_date || null,
+        status: status || 'planned',
+        description: description || null,
+      }])
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update milestone
+router.put('/milestones/:milestoneId', verifyToken, async (req, res) => {
+  try {
+    const userRole = await getUserRole(req.user.id);
+    if (!canManageMilestones(userRole)) {
+      return res.status(403).json({ error: 'You do not have permission to create or edit milestones' });
+    }
+
+    const { data: existing } = await supabase
+      .from('milestones')
+      .select('id, project_id')
+      .eq('id', req.params.milestoneId)
+      .single();
+    if (!existing) {
+      return res.status(404).json({ error: 'Milestone not found' });
+    }
+
+    const { data: member } = await supabase
+      .from('project_members')
+      .select('project_id')
+      .eq('project_id', existing.project_id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!member) {
+      return res.status(404).json({ error: 'Project not found or access denied' });
+    }
+
+    const { version, planned_date, status, description } = req.body;
+    const updates = {};
+    if (version !== undefined) updates.version = version.trim();
+    if (planned_date !== undefined) updates.planned_date = planned_date || null;
+    if (status !== undefined) updates.status = status;
+    if (description !== undefined) updates.description = description || null;
+    updates.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('milestones')
+      .update(updates)
+      .eq('id', req.params.milestoneId)
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete milestone
+router.delete('/milestones/:milestoneId', verifyToken, async (req, res) => {
+  try {
+    const userRole = await getUserRole(req.user.id);
+    if (!canManageMilestones(userRole)) {
+      return res.status(403).json({ error: 'You do not have permission to delete milestones' });
+    }
+
+    const { data: existing } = await supabase
+      .from('milestones')
+      .select('id, project_id')
+      .eq('id', req.params.milestoneId)
+      .single();
+    if (!existing) {
+      return res.status(404).json({ error: 'Milestone not found' });
+    }
+
+    const { data: member } = await supabase
+      .from('project_members')
+      .select('project_id')
+      .eq('project_id', existing.project_id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!member) {
+      return res.status(404).json({ error: 'Project not found or access denied' });
+    }
+
+    const { error } = await supabase
+      .from('milestones')
+      .delete()
+      .eq('id', req.params.milestoneId);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ========== ISSUE TYPES ==========
 router.get('/issue-types', verifyToken, async (req, res) => {
   try {
@@ -334,19 +493,21 @@ router.get('/issue-types', verifyToken, async (req, res) => {
 // ========== ISSUES ==========
 router.get('/issues', verifyToken, async (req, res) => {
   try {
-    const { project_id, sprint_id, release_id, status, assignee_id } = req.query;
+    const { project_id, sprint_id, release_id, milestone_id, status, assignee_id } = req.query;
     let query = supabase
       .from('issues')
       .select(`
         *,
         project:projects(*),
         issue_type:issue_types(*),
-        sprint:sprints(*)
+        sprint:sprints(*),
+        milestone:milestones(*)
       `);
     
     if (project_id) query = query.eq('project_id', project_id);
     if (sprint_id) query = query.eq('sprint_id', sprint_id);
     if (release_id) query = query.eq('release_id', release_id);
+    if (milestone_id) query = query.eq('milestone_id', milestone_id);
     if (status) query = query.eq('status', status);
     if (assignee_id) query = query.eq('assignee_id', assignee_id);
     // Filter by parent_issue_id (null for top-level issues, or specific ID for subtasks)
@@ -404,7 +565,8 @@ router.get('/issues/:id', verifyToken, async (req, res) => {
         *,
         project:projects(*),
         issue_type:issue_types(*),
-        sprint:sprints(*)
+        sprint:sprints(*),
+        milestone:milestones(*)
       `)
       .eq('id', req.params.id)
       .single();
@@ -476,6 +638,7 @@ router.post('/issues', verifyToken, async (req, res) => {
       assignee_id,
       sprint_id,
       release_id,
+      milestone_id,
       parent_issue_id,
       story_points,
       labels,
@@ -515,6 +678,7 @@ router.post('/issues', verifyToken, async (req, res) => {
         reporter_id: req.user.id,
         sprint_id,
         release_id: release_id || null,
+        milestone_id: milestone_id || null,
         parent_issue_id: parent_issue_id || null,
         story_points,
         labels: labels || [],
@@ -719,6 +883,7 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
       if (req.body.estimated_days !== undefined) safe.estimated_days = req.body.estimated_days == null ? null : parseInt(req.body.estimated_days, 10);
       if (req.body.actual_days !== undefined) safe.actual_days = req.body.actual_days == null ? null : parseInt(req.body.actual_days, 10);
       if (req.body.exposed_to_client !== undefined) safe.exposed_to_client = req.body.exposed_to_client === true || req.body.exposed_to_client === 'true';
+      if (req.body.milestone_id !== undefined) safe.milestone_id = req.body.milestone_id || null;
       const pri = req.body.internal_priority || req.body.priority;
       if (pri !== undefined) safe.priority = priorityToLegacy[pri] || pri;
       return safe;

@@ -55,6 +55,11 @@ export function canAssignIssuesToOthers(globalRole) {
   return getRoleConfig(globalRole).project?.canAssignIssuesToOthers === true;
 }
 
+/** Project: can create and edit release milestones */
+export function canManageMilestones(globalRole) {
+  return getRoleConfig(globalRole).project?.canManageMilestones === true;
+}
+
 /** Get full role config for a given role (for future use) */
 export function getProjectPermissions(globalRole) {
   return getRoleConfig(globalRole).project || {};
