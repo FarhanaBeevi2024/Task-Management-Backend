@@ -7,6 +7,7 @@ import {
   canManageProjectMembers,
   canManageMilestones,
 } from './accessConfig.js';
+import { logActivity, logIssueChanges } from './activityLogger.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -117,6 +118,8 @@ router.post('/projects', verifyToken, async (req, res) => {
       .single();
     if (error) throw error;
 
+    await logActivity(supabase, { entity_type: 'PROJECT', entity_id: project.id, action_type: 'CREATE', new_value: project.name, performed_by: req.user.id });
+
     // Add creator as project member when config says so
     if (shouldAutoAddAsProjectMemberOnCreate(userRole)) {
       try {
@@ -196,6 +199,16 @@ router.put('/projects/:id', verifyToken, async (req, res) => {
 
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    const { data: existing } = await supabase.from('projects').select('name, description').eq('id', req.params.id).single();
+    if (existing) {
+      if (updates.name !== undefined && String(existing.name) !== String(updates.name)) {
+        await logActivity(supabase, { entity_type: 'PROJECT', entity_id: req.params.id, action_type: 'UPDATE', field_name: 'name', old_value: existing.name, new_value: updates.name, performed_by: req.user.id });
+      }
+      if (updates.description !== undefined && String(existing.description || '') !== String(updates.description ?? '')) {
+        await logActivity(supabase, { entity_type: 'PROJECT', entity_id: req.params.id, action_type: 'UPDATE', field_name: 'description', old_value: existing.description, new_value: updates.description, performed_by: req.user.id });
+      }
     }
 
     const { data, error } = await supabase
@@ -382,6 +395,7 @@ router.post('/projects/:id/milestones', verifyToken, async (req, res) => {
       .single();
 
     if (error) throw error;
+    await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: data.id, action_type: 'CREATE', new_value: data.version, performed_by: req.user.id });
     res.status(201).json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -423,6 +437,22 @@ router.put('/milestones/:milestoneId', verifyToken, async (req, res) => {
     if (description !== undefined) updates.description = description || null;
     updates.updated_at = new Date().toISOString();
 
+    const { data: existingMilestone } = await supabase.from('milestones').select('version, planned_date, status, description').eq('id', req.params.milestoneId).single();
+    if (existingMilestone) {
+      if (updates.version !== undefined && String(existingMilestone.version) !== String(updates.version)) {
+        await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'UPDATE', field_name: 'version', old_value: existingMilestone.version, new_value: updates.version, performed_by: req.user.id });
+      }
+      if (updates.status !== undefined && String(existingMilestone.status) !== String(updates.status)) {
+        await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'STATUS_CHANGE', field_name: 'status', old_value: existingMilestone.status, new_value: updates.status, performed_by: req.user.id });
+      }
+      if (updates.planned_date !== undefined && String(existingMilestone.planned_date || '') !== String(updates.planned_date || '')) {
+        await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'UPDATE', field_name: 'planned_date', old_value: existingMilestone.planned_date, new_value: updates.planned_date, performed_by: req.user.id });
+      }
+      if (updates.description !== undefined && String(existingMilestone.description || '') !== String(updates.description ?? '')) {
+        await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'UPDATE', field_name: 'description', old_value: existingMilestone.description, new_value: updates.description, performed_by: req.user.id });
+      }
+    }
+
     const { data, error } = await supabase
       .from('milestones')
       .update(updates)
@@ -447,7 +477,7 @@ router.delete('/milestones/:milestoneId', verifyToken, async (req, res) => {
 
     const { data: existing } = await supabase
       .from('milestones')
-      .select('id, project_id')
+      .select('id, project_id, version')
       .eq('id', req.params.milestoneId)
       .single();
     if (!existing) {
@@ -463,6 +493,8 @@ router.delete('/milestones/:milestoneId', verifyToken, async (req, res) => {
     if (!member) {
       return res.status(404).json({ error: 'Project not found or access denied' });
     }
+
+    await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'DELETE', old_value: existing.version || existing.id, performed_by: req.user.id });
 
     const { error } = await supabase
       .from('milestones')
@@ -623,6 +655,73 @@ router.get('/issues/:id', verifyToken, async (req, res) => {
   }
 });
 
+// Activity logs for an issue (audit trail). Permission: Admin/Team Leader full; Team Member only for tasks they're part of; Client only status-related.
+router.get('/issues/:id/activity-logs', verifyToken, async (req, res) => {
+  try {
+    const userRole = await getUserRole(req.user.id);
+    const issueId = req.params.id;
+
+    const { data: issue, error: issueError } = await supabase
+      .from('issues')
+      .select('id, project_id, assignee_id, reporter_id')
+      .eq('id', issueId)
+      .single();
+    if (issueError || !issue) {
+      return res.status(404).json({ error: 'Issue not found' });
+    }
+
+    const { data: member } = await supabase
+      .from('project_members')
+      .select('project_id')
+      .eq('project_id', issue.project_id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!member) {
+      return res.status(403).json({ error: 'Access denied to this issue' });
+    }
+
+    if (userRole === 'team_member') {
+      const isPartOfTask = issue.assignee_id === req.user.id || issue.reporter_id === req.user.id;
+      if (!isPartOfTask) {
+        return res.status(403).json({ error: 'You can only view activity for tasks you are assigned to or created' });
+      }
+    }
+
+    let query = supabase
+      .from('activity_logs')
+      .select('*')
+      .eq('entity_type', 'TASK')
+      .eq('entity_id', issueId)
+      .order('performed_at', { ascending: false });
+
+    const { data: logs, error: logsError } = await query;
+    if (logsError) throw logsError;
+
+    let filtered = logs || [];
+    if (userRole === 'client') {
+      filtered = filtered.filter((log) => log.action_type === 'STATUS_CHANGE' || log.field_name === 'status');
+    }
+
+    const performerIds = [...new Set(filtered.map((l) => l.performed_by).filter(Boolean))];
+    let profiles = {};
+    if (performerIds.length > 0) {
+      const { data: profilesData } = await supabase.from('profiles').select('id, email').in('id', performerIds);
+      if (profilesData) {
+        profilesData.forEach((p) => { profiles[p.id] = p; });
+      }
+    }
+
+    const result = filtered.map((log) => ({
+      ...log,
+      performed_by_email: log.performed_by ? (profiles[log.performed_by]?.email || 'Unknown') : null,
+    }));
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.post('/issues', verifyToken, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
@@ -692,6 +791,14 @@ router.post('/issues', verifyToken, async (req, res) => {
       .single();
     
     if (error) throw error;
+
+    await logActivity(supabase, {
+      entity_type: 'TASK',
+      entity_id: issue.id,
+      action_type: 'CREATE',
+      new_value: issue.issue_key || issue.summary,
+      performed_by: req.user.id,
+    });
 
     // Fetch project and issue_type with separate queries (avoids any schema cache issues)
     let project = null;
@@ -772,7 +879,8 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
           updateData[field] = req.body[field];
         }
       });
-      
+      await logIssueChanges(supabase, req.params.id, currentIssue, updateData, req.user.id);
+
       const { data: issue, error } = await supabase
         .from('issues')
         .update(updateData)
@@ -828,7 +936,8 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
       if (currentIssue.assignee_id !== req.user.id && currentIssue.reporter_id !== req.user.id) {
         return res.status(403).json({ error: 'You can only update issues assigned to you' });
       }
-      
+      await logIssueChanges(supabase, req.params.id, currentIssue, updateData, req.user.id);
+
       const { data: issue, error } = await supabase
         .from('issues')
         .update(updateData)
@@ -888,6 +997,18 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
       if (pri !== undefined) safe.priority = priorityToLegacy[pri] || pri;
       return safe;
     };
+
+    const updatesForLog = {};
+    if (req.body.status !== undefined) updatesForLog.status = req.body.status;
+    const pri = req.body.internal_priority || req.body.priority;
+    if (pri !== undefined) updatesForLog.internal_priority = pri;
+    if (req.body.client_priority !== undefined) updatesForLog.client_priority = req.body.client_priority;
+    if (req.body.assignee_id !== undefined) updatesForLog.assignee_id = req.body.assignee_id;
+    if (req.body.due_date !== undefined) updatesForLog.due_date = req.body.due_date;
+    if (req.body.milestone_id !== undefined) updatesForLog.milestone_id = req.body.milestone_id || null;
+    if (req.body.summary !== undefined) updatesForLog.summary = req.body.summary;
+    if (req.body.description !== undefined) updatesForLog.description = req.body.description;
+    await logIssueChanges(supabase, req.params.id, currentIssue, updatesForLog, req.user.id);
 
     let result = await supabase
       .from('issues')
@@ -950,6 +1071,10 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
 
 router.delete('/issues/:id', verifyToken, async (req, res) => {
   try {
+    const { data: existing } = await supabase.from('issues').select('id, issue_key, summary').eq('id', req.params.id).single();
+    if (existing) {
+      await logActivity(supabase, { entity_type: 'TASK', entity_id: req.params.id, action_type: 'DELETE', old_value: existing.issue_key || existing.summary, performed_by: req.user.id });
+    }
     const { error } = await supabase
       .from('issues')
       .delete()
@@ -1092,6 +1217,8 @@ router.post('/issues/:issue_id/comments', verifyToken, async (req, res) => {
       .select('*')
       .single();
     if (error) throw error;
+
+    await logActivity(supabase, { entity_type: 'TASK', entity_id: req.params.issue_id, action_type: 'COMMENT_ADDED', new_value: (body || '').slice(0, 200), performed_by: req.user.id });
     
     // Get author email from profiles
     const { data: authorProfile } = await supabase
