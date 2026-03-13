@@ -47,6 +47,35 @@ const getUserRole = async (userId) => {
   return data.role;
 };
 
+// Helper to create a notification for a user
+const createAssignmentNotification = async ({ userId, issue, actorEmail }) => {
+  if (!userId || !issue) return;
+  try {
+    const messageParts = [];
+    if (actorEmail) {
+      messageParts.push(`${actorEmail} assigned you to`);
+    } else {
+      messageParts.push('You have been assigned to');
+    }
+    const summary = issue.summary || 'a task';
+    const keyPart = issue.issue_key ? ` (${issue.issue_key})` : '';
+    messageParts.push(`${summary}${keyPart}`);
+    const message = messageParts.join(' ');
+
+    await supabase.from('notifications').insert([
+      {
+        user_id: userId,
+        message,
+        related_type: 'issue',
+        related_id: issue.id,
+      },
+    ]);
+  } catch (err) {
+    // Log and continue; notifications should not break main flow
+    console.error('Failed to create assignment notification', err);
+  }
+};
+
 // ========== PROJECTS ==========
 // List projects: everyone (including superadmin) sees only projects they are in via project_members.
 // Each project includes current_user_project_role for the requesting user (e.g. for client column visibility).
@@ -842,7 +871,16 @@ router.post('/issues', verifyToken, async (req, res) => {
       assignee: issueWithJoins.assignee_id ? profiles[issueWithJoins.assignee_id] || { id: issueWithJoins.assignee_id, email: 'Unknown' } : null,
       reporter: reporterProfile || { id: req.user.id, email: req.user.email || 'Unknown' }
     };
-    
+
+    // Create notification for assignee if different from reporter
+    if (issueWithUsers.assignee_id && issueWithUsers.assignee_id !== req.user.id) {
+      await createAssignmentNotification({
+        userId: issueWithUsers.assignee_id,
+        issue: issueWithUsers,
+        actorEmail: reporterProfile?.email || req.user.email || null,
+      });
+    }
+
     res.status(201).json(issueWithUsers);
   } catch (error) {
     const msg = error?.message || '';
@@ -1062,7 +1100,29 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
       assignee: issue.assignee_id ? profiles[issue.assignee_id] || { id: issue.assignee_id, email: 'Unknown' } : null,
       reporter: issue.reporter_id ? profiles[issue.reporter_id] || { id: issue.reporter_id, email: 'Unknown' } : null
     };
-    
+
+    // If the assignee changed, create a notification for the new assignee
+    if (
+      updatesForLog.assignee_id &&
+      updatesForLog.assignee_id !== currentIssue.assignee_id
+    ) {
+      // Fetch actor email
+      let actorEmail = req.user.email || null;
+      if (!actorEmail) {
+        const { data: actorProfile } = await supabase
+          .from('profiles')
+          .select('email')
+          .eq('id', req.user.id)
+          .maybeSingle();
+        actorEmail = actorProfile?.email || null;
+      }
+      await createAssignmentNotification({
+        userId: updatesForLog.assignee_id,
+        issue: issueWithUsers,
+        actorEmail,
+      });
+    }
+
     res.json(issueWithUsers);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1270,6 +1330,56 @@ router.post('/clients', verifyToken, async (req, res) => {
       .single();
     if (error) throw error;
     res.status(201).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== NOTIFICATIONS ==========
+// Get notifications for current user (supports status filter: all | unread | read)
+router.get('/notifications', verifyToken, async (req, res) => {
+  try {
+    const { status } = req.query || {};
+
+    let query = supabase
+      .from('notifications')
+      .select('*')
+      .eq('user_id', req.user.id);
+
+    if (!status || status === 'unread') {
+      query = query.eq('is_read', false);
+    } else if (status === 'read') {
+      query = query.eq('is_read', true);
+    }
+
+    const { data, error } = await query
+      .order('created_at', { ascending: false })
+      .limit(100);
+
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark notifications as read
+router.post('/notifications/mark-read', verifyToken, async (req, res) => {
+  try {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'No notification IDs provided' });
+    }
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .update({ is_read: true })
+      .in('id', ids)
+      .eq('user_id', req.user.id)
+      .select('id, is_read');
+
+    if (error) throw error;
+    res.json(data || []);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
