@@ -1,5 +1,5 @@
 import express from 'express';
-import { createClient } from '@supabase/supabase-js';
+import { supabaseAdmin } from './supabaseAdmin.js';
 import {
   canUserCreateProject,
   shouldAutoAddAsProjectMemberOnCreate,
@@ -8,36 +8,20 @@ import {
   canManageMilestones,
 } from './accessConfig.js';
 import { logActivity, logIssueChanges } from './activityLogger.js';
-import dotenv from 'dotenv';
-
-dotenv.config();
+import { authenticate, loadGlobalRole } from './middleware/auth.js';
+import {
+  requireOrgContext,
+  requireOrgRole,
+  attachOrgFromProject,
+  attachOrgFromIssue,
+  requireSameOrganizationForResource,
+} from './middleware/organization.js';
 
 const router = express.Router();
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-// Middleware to verify token
-const verifyToken = async (req, res, next) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
-  try {
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-    if (error || !user) {
-      return res.status(401).json({ error: 'Invalid token' });
-    }
-    req.user = user;
-    next();
-  } catch (error) {
-    res.status(401).json({ error: 'Token verification failed' });
-  }
-};
 
 // Helper function to get user role
 const getUserRole = async (userId) => {
-  const { data, error } = await supabase
+  const { data, error } = await supabaseAdmin
     .from('user_roles')
     .select('role')
     .eq('user_id', userId)
@@ -48,7 +32,7 @@ const getUserRole = async (userId) => {
 };
 
 // Helper to create a notification for a user
-const createAssignmentNotification = async ({ userId, issue, actorEmail }) => {
+const createAssignmentNotification = async ({ organizationId, userId, issue, actorEmail }) => {
   if (!userId || !issue) return;
   try {
     const messageParts = [];
@@ -62,12 +46,13 @@ const createAssignmentNotification = async ({ userId, issue, actorEmail }) => {
     messageParts.push(`${summary}${keyPart}`);
     const message = messageParts.join(' ');
 
-    await supabase.from('notifications').insert([
+    await supabaseAdmin.from('notifications').insert([
       {
         user_id: userId,
         message,
         related_type: 'issue',
         related_id: issue.id,
+        organization_id: organizationId || issue.organization_id || null,
       },
     ]);
   } catch (err) {
@@ -76,12 +61,15 @@ const createAssignmentNotification = async ({ userId, issue, actorEmail }) => {
   }
 };
 
+// Router-level auth + role
+router.use(authenticate, loadGlobalRole);
+
 // ========== PROJECTS ==========
 // List projects: everyone (including superadmin) sees only projects they are in via project_members.
 // Each project includes current_user_project_role for the requesting user (e.g. for client column visibility).
-router.get('/projects', verifyToken, async (req, res) => {
+router.get('/projects', requireOrgContext, async (req, res) => {
   try {
-    const { data: memberships, error: membershipsError } = await supabase
+    const { data: memberships, error: membershipsError } = await supabaseAdmin
       .from('project_members')
       .select('project_id, project_role')
       .eq('user_id', req.user.id);
@@ -103,10 +91,11 @@ router.get('/projects', verifyToken, async (req, res) => {
       return res.json([]);
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('projects')
       .select('*')
       .in('id', projectIds)
+      .eq('organization_id', req.organizationId)
       .order('created_at', { ascending: false });
 
     if (error) throw error;
@@ -122,7 +111,7 @@ router.get('/projects', verifyToken, async (req, res) => {
   }
 });
 
-router.post('/projects', verifyToken, async (req, res) => {
+router.post('/projects', requireOrgContext, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     const canCreate = canUserCreateProject(userRole);
@@ -133,7 +122,7 @@ router.post('/projects', verifyToken, async (req, res) => {
     }
 
     const { key, name, description, lead_id, client_id } = req.body;
-    const { data: project, error } = await supabase
+    const { data: project, error } = await supabaseAdmin
       .from('projects')
       .insert([{
         key: key.toUpperCase(),
@@ -141,18 +130,19 @@ router.post('/projects', verifyToken, async (req, res) => {
         description,
         lead_id: lead_id || req.user.id,
         client_id: client_id || null,
-        created_by: req.user.id
+        created_by: req.user.id,
+        organization_id: req.organizationId,
       }])
       .select('*')
       .single();
     if (error) throw error;
 
-    await logActivity(supabase, { entity_type: 'PROJECT', entity_id: project.id, action_type: 'CREATE', new_value: project.name, performed_by: req.user.id });
+    await logActivity(supabaseAdmin, { entity_type: 'PROJECT', entity_id: project.id, action_type: 'CREATE', new_value: project.name, performed_by: req.user.id, organization_id: req.organizationId });
 
     // Add creator as project member when config says so
     if (shouldAutoAddAsProjectMemberOnCreate(userRole)) {
       try {
-        await supabase
+        await supabaseAdmin
           .from('project_members')
           .upsert(
             {
@@ -174,9 +164,9 @@ router.post('/projects', verifyToken, async (req, res) => {
 });
 
 // Current user's project role for this project (e.g. for client column visibility on board).
-router.get('/projects/:id/my-role', verifyToken, async (req, res) => {
+router.get('/projects/:id/my-role', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, async (req, res) => {
   try {
-    const { data: member, error } = await supabase
+    const { data: member, error } = await supabaseAdmin
       .from('project_members')
       .select('project_role')
       .eq('project_id', req.params.id)
@@ -192,9 +182,9 @@ router.get('/projects/:id/my-role', verifyToken, async (req, res) => {
   }
 });
 
-router.get('/projects/:id', verifyToken, async (req, res) => {
+router.get('/projects/:id', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, async (req, res) => {
   try {
-    const { data: member, error: memberError } = await supabase
+    const { data: member, error: memberError } = await supabaseAdmin
       .from('project_members')
       .select('project_id')
       .eq('project_id', req.params.id)
@@ -203,10 +193,11 @@ router.get('/projects/:id', verifyToken, async (req, res) => {
     if (memberError || !member) {
       return res.status(404).json({ error: 'Project not found or access denied' });
     }
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('projects')
       .select('*')
       .eq('id', req.params.id)
+      .eq('organization_id', req.organizationId)
       .single();
     if (error) throw error;
     res.json(data);
@@ -215,7 +206,7 @@ router.get('/projects/:id', verifyToken, async (req, res) => {
   }
 });
 
-router.put('/projects/:id', verifyToken, async (req, res) => {
+router.put('/projects/:id', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     if (!canManageProjectMembers(userRole)) {
@@ -230,20 +221,21 @@ router.put('/projects/:id', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
 
-    const { data: existing } = await supabase.from('projects').select('name, description').eq('id', req.params.id).single();
+    const { data: existing } = await supabaseAdmin.from('projects').select('name, description, organization_id').eq('id', req.params.id).eq('organization_id', req.organizationId).single();
     if (existing) {
       if (updates.name !== undefined && String(existing.name) !== String(updates.name)) {
-        await logActivity(supabase, { entity_type: 'PROJECT', entity_id: req.params.id, action_type: 'UPDATE', field_name: 'name', old_value: existing.name, new_value: updates.name, performed_by: req.user.id });
+        await logActivity(supabaseAdmin, { entity_type: 'PROJECT', entity_id: req.params.id, action_type: 'UPDATE', field_name: 'name', old_value: existing.name, new_value: updates.name, performed_by: req.user.id, organization_id: req.organizationId });
       }
       if (updates.description !== undefined && String(existing.description || '') !== String(updates.description ?? '')) {
-        await logActivity(supabase, { entity_type: 'PROJECT', entity_id: req.params.id, action_type: 'UPDATE', field_name: 'description', old_value: existing.description, new_value: updates.description, performed_by: req.user.id });
+        await logActivity(supabaseAdmin, { entity_type: 'PROJECT', entity_id: req.params.id, action_type: 'UPDATE', field_name: 'description', old_value: existing.description, new_value: updates.description, performed_by: req.user.id, organization_id: req.organizationId });
       }
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('projects')
       .update(updates)
       .eq('id', req.params.id)
+      .eq('organization_id', req.organizationId)
       .select('*')
       .single();
 
@@ -254,10 +246,108 @@ router.put('/projects/:id', verifyToken, async (req, res) => {
   }
 });
 
-// Project members: list
-router.get('/projects/:id/members', verifyToken, async (req, res) => {
+// Delete project (Org Admin / Team Leader). Best-effort cleanup of related rows.
+router.delete('/projects/:id', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
-    const { data: memberships, error: membershipsError } = await supabase
+    const projectId = req.params.id;
+
+    // Load issue ids for cleanup
+    const { data: issues, error: issuesError } = await supabaseAdmin
+      .from('issues')
+      .select('id')
+      .eq('project_id', projectId)
+      .eq('organization_id', req.organizationId);
+    if (issuesError) throw issuesError;
+
+    const issueIds = (issues || []).map((i) => i.id);
+
+    // Cleanup notifications/comments/activity logs tied to issues
+    if (issueIds.length > 0) {
+      await supabaseAdmin
+        .from('notifications')
+        .delete()
+        .eq('organization_id', req.organizationId)
+        .eq('related_type', 'issue')
+        .in('related_id', issueIds);
+
+      await supabaseAdmin
+        .from('issue_comments')
+        .delete()
+        .in('issue_id', issueIds);
+
+      await supabaseAdmin
+        .from('activity_logs')
+        .delete()
+        .eq('organization_id', req.organizationId)
+        .eq('entity_type', 'TASK')
+        .in('entity_id', issueIds);
+    }
+
+    // Delete issues
+    await supabaseAdmin
+      .from('issues')
+      .delete()
+      .eq('project_id', projectId)
+      .eq('organization_id', req.organizationId);
+
+    // Delete milestones/releases/sprints tied to this project (if present in schema)
+    await supabaseAdmin
+      .from('milestones')
+      .delete()
+      .eq('project_id', projectId)
+      .eq('organization_id', req.organizationId);
+
+    await supabaseAdmin
+      .from('releases')
+      .delete()
+      .eq('project_id', projectId);
+
+    await supabaseAdmin
+      .from('sprints')
+      .delete()
+      .eq('project_id', projectId);
+
+    // Delete project members
+    await supabaseAdmin
+      .from('project_members')
+      .delete()
+      .eq('project_id', projectId);
+
+    // Delete project activity logs
+    await supabaseAdmin
+      .from('activity_logs')
+      .delete()
+      .eq('organization_id', req.organizationId)
+      .eq('entity_type', 'PROJECT')
+      .eq('entity_id', projectId);
+
+    // Finally delete project
+    const { error: deleteProjectError } = await supabaseAdmin
+      .from('projects')
+      .delete()
+      .eq('id', projectId)
+      .eq('organization_id', req.organizationId);
+
+    if (deleteProjectError) throw deleteProjectError;
+
+    res.json({ success: true });
+  } catch (error) {
+    // Common: FK constraint blocks deletion. Return a friendly message.
+    const msg = error?.message || 'Failed to delete project';
+    if (msg.toLowerCase().includes('foreign key') || msg.toLowerCase().includes('violates')) {
+      return res.status(409).json({
+        error: 'Cannot delete project due to related records. Remove related items first or enable cascading deletes in DB.',
+        detail: msg,
+      });
+    }
+    res.status(500).json({ error: msg });
+  }
+});
+
+// Project members: list
+router.get('/projects/:id/members', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, async (req, res) => {
+  try {
+    const { data: memberships, error: membershipsError } = await supabaseAdmin
       .from('project_members')
       .select('project_id, user_id, project_role')
       .eq('project_id', req.params.id);
@@ -272,11 +362,11 @@ router.get('/projects/:id/members', verifyToken, async (req, res) => {
 
     const [{ data: profiles, error: profilesError }, { data: roles, error: rolesError }] =
       await Promise.all([
-        supabase
+        supabaseAdmin
           .from('profiles')
           .select('id, email')
           .in('id', userIds),
-        supabase
+        supabaseAdmin
           .from('user_roles')
           .select('user_id, role')
           .in('user_id', userIds),
@@ -303,7 +393,7 @@ router.get('/projects/:id/members', verifyToken, async (req, res) => {
 });
 
 // Project members: add or update
-router.post('/projects/:id/members', verifyToken, async (req, res) => {
+router.post('/projects/:id/members', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     if (!canManageProjectMembers(userRole)) {
@@ -317,7 +407,7 @@ router.post('/projects/:id/members', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'Invalid user or project_role' });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('project_members')
       .upsert(
         {
@@ -339,14 +429,14 @@ router.post('/projects/:id/members', verifyToken, async (req, res) => {
 });
 
 // Project members: remove
-router.delete('/projects/:id/members/:userId', verifyToken, async (req, res) => {
+router.delete('/projects/:id/members/:userId', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     if (!canManageProjectMembers(userRole)) {
       return res.status(403).json({ error: 'You do not have permission to manage project members' });
     }
 
-    const { error } = await supabase
+    const { error } = await supabaseAdmin
       .from('project_members')
       .delete()
       .eq('project_id', req.params.id)
@@ -362,9 +452,9 @@ router.delete('/projects/:id/members/:userId', verifyToken, async (req, res) => 
 
 // ========== MILESTONES ==========
 // List milestones for a project (any project member can view)
-router.get('/projects/:id/milestones', verifyToken, async (req, res) => {
+router.get('/projects/:id/milestones', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, async (req, res) => {
   try {
-    const { data: member } = await supabase
+    const { data: member } = await supabaseAdmin
       .from('project_members')
       .select('project_id')
       .eq('project_id', req.params.id)
@@ -374,10 +464,11 @@ router.get('/projects/:id/milestones', verifyToken, async (req, res) => {
       return res.status(404).json({ error: 'Project not found or access denied' });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('milestones')
       .select('*')
       .eq('project_id', req.params.id)
+      .eq('organization_id', req.organizationId)
       .order('planned_date', { ascending: true, nullsFirst: false })
       .order('version');
 
@@ -389,14 +480,14 @@ router.get('/projects/:id/milestones', verifyToken, async (req, res) => {
 });
 
 // Create milestone (Admin, Team Leader, Superadmin only)
-router.post('/projects/:id/milestones', verifyToken, async (req, res) => {
+router.post('/projects/:id/milestones', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     if (!canManageMilestones(userRole)) {
       return res.status(403).json({ error: 'You do not have permission to create or edit milestones' });
     }
 
-    const { data: member } = await supabase
+    const { data: member } = await supabaseAdmin
       .from('project_members')
       .select('project_id')
       .eq('project_id', req.params.id)
@@ -411,10 +502,11 @@ router.post('/projects/:id/milestones', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'Version is required' });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('milestones')
       .insert([{
         project_id: req.params.id,
+        organization_id: req.organizationId,
         version: version.trim(),
         planned_date: planned_date || null,
         status: status || 'planned',
@@ -424,7 +516,7 @@ router.post('/projects/:id/milestones', verifyToken, async (req, res) => {
       .single();
 
     if (error) throw error;
-    await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: data.id, action_type: 'CREATE', new_value: data.version, performed_by: req.user.id });
+    await logActivity(supabaseAdmin, { entity_type: 'MILESTONE', entity_id: data.id, action_type: 'CREATE', new_value: data.version, performed_by: req.user.id, organization_id: req.organizationId });
     res.status(201).json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -432,23 +524,24 @@ router.post('/projects/:id/milestones', verifyToken, async (req, res) => {
 });
 
 // Update milestone
-router.put('/milestones/:milestoneId', verifyToken, async (req, res) => {
+router.put('/milestones/:milestoneId', requireOrgContext, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     if (!canManageMilestones(userRole)) {
       return res.status(403).json({ error: 'You do not have permission to create or edit milestones' });
     }
 
-    const { data: existing } = await supabase
+    const { data: existing } = await supabaseAdmin
       .from('milestones')
       .select('id, project_id')
       .eq('id', req.params.milestoneId)
+      .eq('organization_id', req.organizationId)
       .single();
     if (!existing) {
       return res.status(404).json({ error: 'Milestone not found' });
     }
 
-    const { data: member } = await supabase
+    const { data: member } = await supabaseAdmin
       .from('project_members')
       .select('project_id')
       .eq('project_id', existing.project_id)
@@ -466,26 +559,27 @@ router.put('/milestones/:milestoneId', verifyToken, async (req, res) => {
     if (description !== undefined) updates.description = description || null;
     updates.updated_at = new Date().toISOString();
 
-    const { data: existingMilestone } = await supabase.from('milestones').select('version, planned_date, status, description').eq('id', req.params.milestoneId).single();
+    const { data: existingMilestone } = await supabaseAdmin.from('milestones').select('version, planned_date, status, description').eq('id', req.params.milestoneId).eq('organization_id', req.organizationId).single();
     if (existingMilestone) {
       if (updates.version !== undefined && String(existingMilestone.version) !== String(updates.version)) {
-        await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'UPDATE', field_name: 'version', old_value: existingMilestone.version, new_value: updates.version, performed_by: req.user.id });
+        await logActivity(supabaseAdmin, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'UPDATE', field_name: 'version', old_value: existingMilestone.version, new_value: updates.version, performed_by: req.user.id, organization_id: req.organizationId });
       }
       if (updates.status !== undefined && String(existingMilestone.status) !== String(updates.status)) {
-        await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'STATUS_CHANGE', field_name: 'status', old_value: existingMilestone.status, new_value: updates.status, performed_by: req.user.id });
+        await logActivity(supabaseAdmin, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'STATUS_CHANGE', field_name: 'status', old_value: existingMilestone.status, new_value: updates.status, performed_by: req.user.id, organization_id: req.organizationId });
       }
       if (updates.planned_date !== undefined && String(existingMilestone.planned_date || '') !== String(updates.planned_date || '')) {
-        await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'UPDATE', field_name: 'planned_date', old_value: existingMilestone.planned_date, new_value: updates.planned_date, performed_by: req.user.id });
+        await logActivity(supabaseAdmin, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'UPDATE', field_name: 'planned_date', old_value: existingMilestone.planned_date, new_value: updates.planned_date, performed_by: req.user.id, organization_id: req.organizationId });
       }
       if (updates.description !== undefined && String(existingMilestone.description || '') !== String(updates.description ?? '')) {
-        await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'UPDATE', field_name: 'description', old_value: existingMilestone.description, new_value: updates.description, performed_by: req.user.id });
+        await logActivity(supabaseAdmin, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'UPDATE', field_name: 'description', old_value: existingMilestone.description, new_value: updates.description, performed_by: req.user.id, organization_id: req.organizationId });
       }
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('milestones')
       .update(updates)
       .eq('id', req.params.milestoneId)
+      .eq('organization_id', req.organizationId)
       .select('*')
       .single();
 
@@ -497,23 +591,24 @@ router.put('/milestones/:milestoneId', verifyToken, async (req, res) => {
 });
 
 // Delete milestone
-router.delete('/milestones/:milestoneId', verifyToken, async (req, res) => {
+router.delete('/milestones/:milestoneId', requireOrgContext, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     if (!canManageMilestones(userRole)) {
       return res.status(403).json({ error: 'You do not have permission to delete milestones' });
     }
 
-    const { data: existing } = await supabase
+    const { data: existing } = await supabaseAdmin
       .from('milestones')
       .select('id, project_id, version')
       .eq('id', req.params.milestoneId)
+      .eq('organization_id', req.organizationId)
       .single();
     if (!existing) {
       return res.status(404).json({ error: 'Milestone not found' });
     }
 
-    const { data: member } = await supabase
+    const { data: member } = await supabaseAdmin
       .from('project_members')
       .select('project_id')
       .eq('project_id', existing.project_id)
@@ -523,9 +618,9 @@ router.delete('/milestones/:milestoneId', verifyToken, async (req, res) => {
       return res.status(404).json({ error: 'Project not found or access denied' });
     }
 
-    await logActivity(supabase, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'DELETE', old_value: existing.version || existing.id, performed_by: req.user.id });
+    await logActivity(supabaseAdmin, { entity_type: 'MILESTONE', entity_id: req.params.milestoneId, action_type: 'DELETE', old_value: existing.version || existing.id, performed_by: req.user.id, organization_id: req.organizationId });
 
-    const { error } = await supabase
+    const { error } = await supabaseAdmin
       .from('milestones')
       .delete()
       .eq('id', req.params.milestoneId);
@@ -538,9 +633,9 @@ router.delete('/milestones/:milestoneId', verifyToken, async (req, res) => {
 });
 
 // ========== ISSUE TYPES ==========
-router.get('/issue-types', verifyToken, async (req, res) => {
+router.get('/issue-types', async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('issue_types')
       .select('*')
       .order('name');
@@ -552,10 +647,10 @@ router.get('/issue-types', verifyToken, async (req, res) => {
 });
 
 // ========== ISSUES ==========
-router.get('/issues', verifyToken, async (req, res) => {
+router.get('/issues', requireOrgContext, async (req, res) => {
   try {
     const { project_id, sprint_id, release_id, milestone_id, status, assignee_id } = req.query;
-    let query = supabase
+    let query = supabaseAdmin
       .from('issues')
       .select(`
         *,
@@ -564,6 +659,8 @@ router.get('/issues', verifyToken, async (req, res) => {
         sprint:sprints(*),
         milestone:milestones(*)
       `);
+    
+    query = query.eq('organization_id', req.organizationId);
     
     if (project_id) query = query.eq('project_id', project_id);
     if (sprint_id) query = query.eq('sprint_id', sprint_id);
@@ -593,7 +690,7 @@ router.get('/issues', verifyToken, async (req, res) => {
     const userIdsArray = Array.from(userIds);
     let profiles = {};
     if (userIdsArray.length > 0) {
-      const { data: profilesData, error: profilesError } = await supabase
+      const { data: profilesData, error: profilesError } = await supabaseAdmin
         .from('profiles')
         .select('id, email')
         .in('id', userIdsArray);
@@ -618,9 +715,9 @@ router.get('/issues', verifyToken, async (req, res) => {
   }
 });
 
-router.get('/issues/:id', verifyToken, async (req, res) => {
+router.get('/issues/:id', requireOrgContext, async (req, res) => {
   try {
-    const { data: issue, error } = await supabase
+    const { data: issue, error } = await supabaseAdmin
       .from('issues')
       .select(`
         *,
@@ -630,6 +727,7 @@ router.get('/issues/:id', verifyToken, async (req, res) => {
         milestone:milestones(*)
       `)
       .eq('id', req.params.id)
+      .eq('organization_id', req.organizationId)
       .single();
     if (error) throw error;
 
@@ -637,17 +735,19 @@ router.get('/issues/:id', verifyToken, async (req, res) => {
     let parent_issue = null;
     let subtasks = [];
     if (issue.parent_issue_id) {
-      const { data: parent } = await supabase
+      const { data: parent } = await supabaseAdmin
         .from('issues')
         .select('id, issue_key, summary')
         .eq('id', issue.parent_issue_id)
+        .eq('organization_id', req.organizationId)
         .single();
       parent_issue = parent;
     }
-    const { data: subtasksData } = await supabase
+    const { data: subtasksData } = await supabaseAdmin
       .from('issues')
       .select('id, issue_key, summary, status, internal_priority, client_priority')
-      .eq('parent_issue_id', req.params.id);
+      .eq('parent_issue_id', req.params.id)
+      .eq('organization_id', req.organizationId);
     if (subtasksData) subtasks = subtasksData;
 
     // Get user emails from profiles
@@ -657,7 +757,7 @@ router.get('/issues/:id', verifyToken, async (req, res) => {
     
     let profiles = {};
     if (userIds.length > 0) {
-      const { data: profilesData, error: profilesError } = await supabase
+      const { data: profilesData, error: profilesError } = await supabaseAdmin
         .from('profiles')
         .select('id, email')
         .in('id', userIds);
@@ -685,21 +785,22 @@ router.get('/issues/:id', verifyToken, async (req, res) => {
 });
 
 // Activity logs for an issue (audit trail). Permission: Admin/Team Leader full; Team Member only for tasks they're part of; Client only status-related.
-router.get('/issues/:id/activity-logs', verifyToken, async (req, res) => {
+router.get('/issues/:id/activity-logs', requireOrgContext, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     const issueId = req.params.id;
 
-    const { data: issue, error: issueError } = await supabase
+    const { data: issue, error: issueError } = await supabaseAdmin
       .from('issues')
       .select('id, project_id, assignee_id, reporter_id')
       .eq('id', issueId)
+      .eq('organization_id', req.organizationId)
       .single();
     if (issueError || !issue) {
       return res.status(404).json({ error: 'Issue not found' });
     }
 
-    const { data: member } = await supabase
+    const { data: member } = await supabaseAdmin
       .from('project_members')
       .select('project_id')
       .eq('project_id', issue.project_id)
@@ -716,11 +817,12 @@ router.get('/issues/:id/activity-logs', verifyToken, async (req, res) => {
       }
     }
 
-    let query = supabase
+    let query = supabaseAdmin
       .from('activity_logs')
       .select('*')
       .eq('entity_type', 'TASK')
       .eq('entity_id', issueId)
+      .eq('organization_id', req.organizationId)
       .order('performed_at', { ascending: false });
 
     const { data: logs, error: logsError } = await query;
@@ -734,7 +836,7 @@ router.get('/issues/:id/activity-logs', verifyToken, async (req, res) => {
     const performerIds = [...new Set(filtered.map((l) => l.performed_by).filter(Boolean))];
     let profiles = {};
     if (performerIds.length > 0) {
-      const { data: profilesData } = await supabase.from('profiles').select('id, email').in('id', performerIds);
+      const { data: profilesData } = await supabaseAdmin.from('profiles').select('id, email').in('id', performerIds);
       if (profilesData) {
         profilesData.forEach((p) => { profiles[p.id] = p; });
       }
@@ -751,7 +853,7 @@ router.get('/issues/:id/activity-logs', verifyToken, async (req, res) => {
   }
 });
 
-router.post('/issues', verifyToken, async (req, res) => {
+router.post('/issues', requireOrgContext, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     const {
@@ -792,9 +894,10 @@ router.post('/issues', verifyToken, async (req, res) => {
       finalInternalPriority = priorityMap[finalInternalPriority];
     }
     
-    const { data: issue, error } = await supabase
+    const { data: issue, error } = await supabaseAdmin
       .from('issues')
       .insert([{
+        organization_id: req.organizationId,
         project_id,
         issue_type_id,
         summary,
@@ -821,20 +924,21 @@ router.post('/issues', verifyToken, async (req, res) => {
     
     if (error) throw error;
 
-    await logActivity(supabase, {
+    await logActivity(supabaseAdmin, {
       entity_type: 'TASK',
       entity_id: issue.id,
       action_type: 'CREATE',
       new_value: issue.issue_key || issue.summary,
       performed_by: req.user.id,
+      organization_id: req.organizationId,
     });
 
     // Fetch project and issue_type with separate queries (avoids any schema cache issues)
     let project = null;
     let issue_type = null;
     const [{ data: projectData }, { data: issueTypeData }] = await Promise.all([
-      supabase.from('projects').select('*').eq('id', issue.project_id).single(),
-      supabase.from('issue_types').select('*').eq('id', issue.issue_type_id).single()
+      supabaseAdmin.from('projects').select('*').eq('id', issue.project_id).eq('organization_id', req.organizationId).single(),
+      supabaseAdmin.from('issue_types').select('*').eq('id', issue.issue_type_id).single()
     ]);
     if (projectData) project = projectData;
     if (issueTypeData) issue_type = issueTypeData;
@@ -847,7 +951,7 @@ router.post('/issues', verifyToken, async (req, res) => {
     
     let profiles = {};
     if (userIds.length > 0) {
-      const { data: profilesData } = await supabase
+      const { data: profilesData } = await supabaseAdmin
         .from('profiles')
         .select('id, email')
         .in('id', userIds);
@@ -860,7 +964,7 @@ router.post('/issues', verifyToken, async (req, res) => {
     }
     
     // Get reporter email
-    const { data: reporterProfile } = await supabase
+    const { data: reporterProfile } = await supabaseAdmin
       .from('profiles')
       .select('id, email')
       .eq('id', req.user.id)
@@ -875,6 +979,7 @@ router.post('/issues', verifyToken, async (req, res) => {
     // Create notification for assignee if different from reporter
     if (issueWithUsers.assignee_id && issueWithUsers.assignee_id !== req.user.id) {
       await createAssignmentNotification({
+        organizationId: req.organizationId,
         userId: issueWithUsers.assignee_id,
         issue: issueWithUsers,
         actorEmail: reporterProfile?.email || req.user.email || null,
@@ -894,15 +999,16 @@ router.post('/issues', verifyToken, async (req, res) => {
   }
 });
 
-router.put('/issues/:id', verifyToken, async (req, res) => {
+router.put('/issues/:id', requireOrgContext, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
     
     // Get current issue to check permissions
-    const { data: currentIssue, error: fetchError } = await supabase
+    const { data: currentIssue, error: fetchError } = await supabaseAdmin
       .from('issues')
       .select('*')
       .eq('id', req.params.id)
+      .eq('organization_id', req.organizationId)
       .single();
     
     if (fetchError) throw fetchError;
@@ -917,12 +1023,13 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
           updateData[field] = req.body[field];
         }
       });
-      await logIssueChanges(supabase, req.params.id, currentIssue, updateData, req.user.id);
+      await logIssueChanges(supabaseAdmin, req.params.id, currentIssue, updateData, req.user.id);
 
-      const { data: issue, error } = await supabase
+      const { data: issue, error } = await supabaseAdmin
         .from('issues')
         .update(updateData)
         .eq('id', req.params.id)
+        .eq('organization_id', req.organizationId)
         .select(`
           *,
           project:projects(*),
@@ -939,7 +1046,7 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
       
       let profiles = {};
       if (userIds.length > 0) {
-        const { data: profilesData } = await supabase
+        const { data: profilesData } = await supabaseAdmin
           .from('profiles')
           .select('id, email')
           .in('id', userIds);
@@ -974,12 +1081,13 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
       if (currentIssue.assignee_id !== req.user.id && currentIssue.reporter_id !== req.user.id) {
         return res.status(403).json({ error: 'You can only update issues assigned to you' });
       }
-      await logIssueChanges(supabase, req.params.id, currentIssue, updateData, req.user.id);
+      await logIssueChanges(supabaseAdmin, req.params.id, currentIssue, updateData, req.user.id);
 
-      const { data: issue, error } = await supabase
+      const { data: issue, error } = await supabaseAdmin
         .from('issues')
         .update(updateData)
         .eq('id', req.params.id)
+        .eq('organization_id', req.organizationId)
         .select(`
           *,
           project:projects(*),
@@ -996,7 +1104,7 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
       
       let profiles = {};
       if (userIds.length > 0) {
-        const { data: profilesData } = await supabase
+        const { data: profilesData } = await supabaseAdmin
           .from('profiles')
           .select('id, email')
           .in('id', userIds);
@@ -1046,12 +1154,13 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
     if (req.body.milestone_id !== undefined) updatesForLog.milestone_id = req.body.milestone_id || null;
     if (req.body.summary !== undefined) updatesForLog.summary = req.body.summary;
     if (req.body.description !== undefined) updatesForLog.description = req.body.description;
-    await logIssueChanges(supabase, req.params.id, currentIssue, updatesForLog, req.user.id);
+    await logIssueChanges(supabaseAdmin, req.params.id, currentIssue, updatesForLog, req.user.id);
 
-    let result = await supabase
+    let result = await supabaseAdmin
       .from('issues')
       .update(req.body)
       .eq('id', req.params.id)
+      .eq('organization_id', req.organizationId)
       .select(`
         *,
         project:projects(*),
@@ -1061,10 +1170,11 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
 
     if (result.error && (result.error.message.includes('schema cache') || result.error.message.includes('client_priority') || result.error.message.includes('internal_priority') || result.error.message.includes('estimated_days') || result.error.message.includes('actual_days') || result.error.message.includes('exposed_to_client'))) {
       const safeBody = buildSafeUpdateBody();
-      result = await supabase
+      result = await supabaseAdmin
         .from('issues')
         .update(safeBody)
         .eq('id', req.params.id)
+        .eq('organization_id', req.organizationId)
         .select(`
           *,
           project:projects(*),
@@ -1083,7 +1193,7 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
     
     let profiles = {};
     if (userIds.length > 0) {
-      const { data: profilesData } = await supabase
+      const { data: profilesData } = await supabaseAdmin
         .from('profiles')
         .select('id, email')
         .in('id', userIds);
@@ -1109,7 +1219,7 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
       // Fetch actor email
       let actorEmail = req.user.email || null;
       if (!actorEmail) {
-        const { data: actorProfile } = await supabase
+        const { data: actorProfile } = await supabaseAdmin
           .from('profiles')
           .select('email')
           .eq('id', req.user.id)
@@ -1117,6 +1227,7 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
         actorEmail = actorProfile?.email || null;
       }
       await createAssignmentNotification({
+        organizationId: req.organizationId,
         userId: updatesForLog.assignee_id,
         issue: issueWithUsers,
         actorEmail,
@@ -1129,13 +1240,13 @@ router.put('/issues/:id', verifyToken, async (req, res) => {
   }
 });
 
-router.delete('/issues/:id', verifyToken, async (req, res) => {
+router.delete('/issues/:id', requireOrgContext, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
-    const { data: existing } = await supabase.from('issues').select('id, issue_key, summary').eq('id', req.params.id).single();
+    const { data: existing } = await supabaseAdmin.from('issues').select('id, issue_key, summary').eq('id', req.params.id).eq('organization_id', req.organizationId).single();
     if (existing) {
-      await logActivity(supabase, { entity_type: 'TASK', entity_id: req.params.id, action_type: 'DELETE', old_value: existing.issue_key || existing.summary, performed_by: req.user.id });
+      await logActivity(supabaseAdmin, { entity_type: 'TASK', entity_id: req.params.id, action_type: 'DELETE', old_value: existing.issue_key || existing.summary, performed_by: req.user.id, organization_id: req.organizationId });
     }
-    const { error } = await supabase
+    const { error } = await supabaseAdmin
       .from('issues')
       .delete()
       .eq('id', req.params.id);
@@ -1147,10 +1258,16 @@ router.delete('/issues/:id', verifyToken, async (req, res) => {
 });
 
 // ========== SPRINTS ==========
-router.get('/sprints', verifyToken, async (req, res) => {
+router.get('/sprints', requireOrgContext, async (req, res) => {
   try {
     const { project_id, state } = req.query;
-    let query = supabase
+    if (project_id) {
+      const { data: p } = await supabaseAdmin.from('projects').select('id, organization_id').eq('id', project_id).maybeSingle();
+      if (!p || String(p.organization_id) !== String(req.organizationId)) {
+        return res.status(403).json({ error: 'Project not found or access denied' });
+      }
+    }
+    let query = supabaseAdmin
       .from('sprints')
       .select('*, project:projects(*)');
     
@@ -1166,10 +1283,16 @@ router.get('/sprints', verifyToken, async (req, res) => {
 });
 
 // ========== RELEASES ==========
-router.get('/releases', verifyToken, async (req, res) => {
+router.get('/releases', requireOrgContext, async (req, res) => {
   try {
     const { project_id } = req.query;
-    let query = supabase
+    if (project_id) {
+      const { data: p } = await supabaseAdmin.from('projects').select('id, organization_id').eq('id', project_id).maybeSingle();
+      if (!p || String(p.organization_id) !== String(req.organizationId)) {
+        return res.status(403).json({ error: 'Project not found or access denied' });
+      }
+    }
+    let query = supabaseAdmin
       .from('releases')
       .select('*, project:projects(*)');
     
@@ -1183,10 +1306,16 @@ router.get('/releases', verifyToken, async (req, res) => {
   }
 });
 
-router.post('/releases', verifyToken, async (req, res) => {
+router.post('/releases', requireOrgContext, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const { project_id, name, description, start_date, end_date, is_active } = req.body;
-    const { data, error } = await supabase
+    if (project_id) {
+      const { data: p } = await supabaseAdmin.from('projects').select('id, organization_id').eq('id', project_id).maybeSingle();
+      if (!p || String(p.organization_id) !== String(req.organizationId)) {
+        return res.status(403).json({ error: 'Project not found or access denied' });
+      }
+    }
+    const { data, error } = await supabaseAdmin
       .from('releases')
       .insert([{
         project_id,
@@ -1205,10 +1334,16 @@ router.post('/releases', verifyToken, async (req, res) => {
   }
 });
 
-router.post('/sprints', verifyToken, async (req, res) => {
+router.post('/sprints', requireOrgContext, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const { project_id, name, goal, start_date, end_date, state } = req.body;
-    const { data, error } = await supabase
+    if (project_id) {
+      const { data: p } = await supabaseAdmin.from('projects').select('id, organization_id').eq('id', project_id).maybeSingle();
+      if (!p || String(p.organization_id) !== String(req.organizationId)) {
+        return res.status(403).json({ error: 'Project not found or access denied' });
+      }
+    }
+    const { data, error } = await supabaseAdmin
       .from('sprints')
       .insert([{
         project_id,
@@ -1228,9 +1363,9 @@ router.post('/sprints', verifyToken, async (req, res) => {
 });
 
 // ========== COMMENTS ==========
-router.get('/issues/:issue_id/comments', verifyToken, async (req, res) => {
+router.get('/issues/:issue_id/comments', requireOrgContext, attachOrgFromIssue, requireSameOrganizationForResource, async (req, res) => {
   try {
-    const { data: comments, error } = await supabase
+    const { data: comments, error } = await supabaseAdmin
       .from('issue_comments')
       .select('*')
       .eq('issue_id', req.params.issue_id)
@@ -1241,7 +1376,7 @@ router.get('/issues/:issue_id/comments', verifyToken, async (req, res) => {
     const authorIds = comments.map(c => c.author_id);
     let profiles = {};
     if (authorIds.length > 0) {
-      const { data: profilesData } = await supabase
+      const { data: profilesData } = await supabaseAdmin
         .from('profiles')
         .select('id, email')
         .in('id', authorIds);
@@ -1264,10 +1399,10 @@ router.get('/issues/:issue_id/comments', verifyToken, async (req, res) => {
   }
 });
 
-router.post('/issues/:issue_id/comments', verifyToken, async (req, res) => {
+router.post('/issues/:issue_id/comments', requireOrgContext, attachOrgFromIssue, requireSameOrganizationForResource, async (req, res) => {
   try {
     const { body } = req.body;
-    const { data: comment, error } = await supabase
+    const { data: comment, error } = await supabaseAdmin
       .from('issue_comments')
       .insert([{
         issue_id: req.params.issue_id,
@@ -1278,10 +1413,10 @@ router.post('/issues/:issue_id/comments', verifyToken, async (req, res) => {
       .single();
     if (error) throw error;
 
-    await logActivity(supabase, { entity_type: 'TASK', entity_id: req.params.issue_id, action_type: 'COMMENT_ADDED', new_value: (body || '').slice(0, 200), performed_by: req.user.id });
+    await logActivity(supabaseAdmin, { entity_type: 'TASK', entity_id: req.params.issue_id, action_type: 'COMMENT_ADDED', new_value: (body || '').slice(0, 200), performed_by: req.user.id, organization_id: req.organizationId });
     
     // Get author email from profiles
-    const { data: authorProfile } = await supabase
+    const { data: authorProfile } = await supabaseAdmin
       .from('profiles')
       .select('id, email')
       .eq('id', req.user.id)
@@ -1299,11 +1434,12 @@ router.post('/issues/:issue_id/comments', verifyToken, async (req, res) => {
 });
 
 // ========== CLIENTS ==========
-router.get('/clients', verifyToken, async (req, res) => {
+router.get('/clients', requireOrgContext, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('clients')
       .select('*')
+      .eq('organization_id', req.organizationId)
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json(data);
@@ -1312,10 +1448,10 @@ router.get('/clients', verifyToken, async (req, res) => {
   }
 });
 
-router.post('/clients', verifyToken, async (req, res) => {
+router.post('/clients', requireOrgContext, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const { name, email, company, phone, address, notes } = req.body;
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('clients')
       .insert([{
         name,
@@ -1324,7 +1460,8 @@ router.post('/clients', verifyToken, async (req, res) => {
         phone,
         address,
         notes,
-        created_by: req.user.id
+        created_by: req.user.id,
+        organization_id: req.organizationId,
       }])
       .select()
       .single();
@@ -1337,14 +1474,15 @@ router.post('/clients', verifyToken, async (req, res) => {
 
 // ========== NOTIFICATIONS ==========
 // Get notifications for current user (supports status filter: all | unread | read)
-router.get('/notifications', verifyToken, async (req, res) => {
+router.get('/notifications', requireOrgContext, async (req, res) => {
   try {
     const { status } = req.query || {};
 
-    let query = supabase
+    let query = supabaseAdmin
       .from('notifications')
       .select('*')
-      .eq('user_id', req.user.id);
+      .eq('user_id', req.user.id)
+      .eq('organization_id', req.organizationId);
 
     if (!status || status === 'unread') {
       query = query.eq('is_read', false);
@@ -1357,25 +1495,57 @@ router.get('/notifications', verifyToken, async (req, res) => {
       .limit(100);
 
     if (error) throw error;
-    res.json(data || []);
+
+    let notifications = data || [];
+
+    // Client: only show notifications for issues that are DONE and exposed_to_client.
+    if (req.orgRole === 'client') {
+      const issueIds = [
+        ...new Set(
+          notifications
+            .filter((n) => n.related_type === 'issue' && n.related_id)
+            .map((n) => n.related_id)
+        ),
+      ];
+
+      if (issueIds.length === 0) {
+        return res.json([]);
+      }
+
+      const { data: issues, error: issuesError } = await supabaseAdmin
+        .from('issues')
+        .select('id')
+        .in('id', issueIds)
+        .eq('organization_id', req.organizationId)
+        .eq('exposed_to_client', true)
+        .eq('status', 'done');
+
+      if (issuesError) throw issuesError;
+
+      const allowedIssueIdSet = new Set((issues || []).map((i) => i.id));
+      notifications = notifications.filter((n) => allowedIssueIdSet.has(n.related_id));
+    }
+
+    res.json(notifications);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
 // Mark notifications as read
-router.post('/notifications/mark-read', verifyToken, async (req, res) => {
+router.post('/notifications/mark-read', requireOrgContext, async (req, res) => {
   try {
     const { ids } = req.body || {};
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: 'No notification IDs provided' });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('notifications')
       .update({ is_read: true })
       .in('id', ids)
       .eq('user_id', req.user.id)
+      .eq('organization_id', req.organizationId)
       .select('id, is_read');
 
     if (error) throw error;
@@ -1385,12 +1555,13 @@ router.post('/notifications/mark-read', verifyToken, async (req, res) => {
   }
 });
 
-router.get('/clients/:id', verifyToken, async (req, res) => {
+router.get('/clients/:id', requireOrgContext, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('clients')
       .select('*')
       .eq('id', req.params.id)
+      .eq('organization_id', req.organizationId)
       .single();
     if (error) throw error;
     res.json(data);
@@ -1399,12 +1570,13 @@ router.get('/clients/:id', verifyToken, async (req, res) => {
   }
 });
 
-router.put('/clients/:id', verifyToken, async (req, res) => {
+router.put('/clients/:id', requireOrgContext, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('clients')
       .update(req.body)
       .eq('id', req.params.id)
+      .eq('organization_id', req.organizationId)
       .select()
       .single();
     if (error) throw error;
@@ -1415,10 +1587,16 @@ router.put('/clients/:id', verifyToken, async (req, res) => {
 });
 
 // ========== RELEASES ==========
-router.get('/releases', verifyToken, async (req, res) => {
+router.get('/releases', requireOrgContext, async (req, res) => {
   try {
     const { project_id, is_active } = req.query;
-    let query = supabase
+    if (project_id) {
+      const { data: p } = await supabaseAdmin.from('projects').select('id, organization_id').eq('id', project_id).maybeSingle();
+      if (!p || String(p.organization_id) !== String(req.organizationId)) {
+        return res.status(403).json({ error: 'Project not found or access denied' });
+      }
+    }
+    let query = supabaseAdmin
       .from('releases')
       .select('*, project:projects(*)');
     
@@ -1433,10 +1611,16 @@ router.get('/releases', verifyToken, async (req, res) => {
   }
 });
 
-router.post('/releases', verifyToken, async (req, res) => {
+router.post('/releases', requireOrgContext, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
     const { project_id, name, description, version, start_date, end_date, is_active } = req.body;
-    const { data, error } = await supabase
+    if (project_id) {
+      const { data: p } = await supabaseAdmin.from('projects').select('id, organization_id').eq('id', project_id).maybeSingle();
+      if (!p || String(p.organization_id) !== String(req.organizationId)) {
+        return res.status(403).json({ error: 'Project not found or access denied' });
+      }
+    }
+    const { data, error } = await supabaseAdmin
       .from('releases')
       .insert([{
         project_id,
@@ -1457,23 +1641,42 @@ router.post('/releases', verifyToken, async (req, res) => {
   }
 });
 
-router.get('/releases/:id', verifyToken, async (req, res) => {
+router.get('/releases/:id', requireOrgContext, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('releases')
       .select('*, project:projects(*)')
       .eq('id', req.params.id)
       .single();
     if (error) throw error;
+    if (data?.project_id) {
+      const { data: p } = await supabaseAdmin.from('projects').select('id, organization_id').eq('id', data.project_id).maybeSingle();
+      if (!p || String(p.organization_id) !== String(req.organizationId)) {
+        return res.status(403).json({ error: 'Release not found or access denied' });
+      }
+    }
     res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-router.put('/releases/:id', verifyToken, async (req, res) => {
+router.put('/releases/:id', requireOrgContext, requireOrgRole(['org_admin', 'team_leader']), async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from('releases')
+      .select('id, project_id')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (exErr || !existing) return res.status(404).json({ error: 'Release not found' });
+    if (existing.project_id) {
+      const { data: p } = await supabaseAdmin.from('projects').select('id, organization_id').eq('id', existing.project_id).maybeSingle();
+      if (!p || String(p.organization_id) !== String(req.organizationId)) {
+        return res.status(403).json({ error: 'Release not found or access denied' });
+      }
+    }
+
+    const { data, error } = await supabaseAdmin
       .from('releases')
       .update(req.body)
       .eq('id', req.params.id)

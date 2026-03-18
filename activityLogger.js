@@ -10,7 +10,10 @@
  * @param {string} [params.new_value]
  * @param {string} params.performed_by - user UUID
  */
-export async function logActivity(supabase, { entity_type, entity_id, action_type, field_name = null, old_value = null, new_value = null, performed_by }) {
+export async function logActivity(
+  supabase,
+  { entity_type, entity_id, action_type, field_name = null, old_value = null, new_value = null, performed_by, organization_id = null }
+) {
   const row = {
     entity_type,
     entity_id,
@@ -19,6 +22,7 @@ export async function logActivity(supabase, { entity_type, entity_id, action_typ
     old_value: old_value != null ? String(old_value) : null,
     new_value: new_value != null ? String(new_value) : null,
     performed_by: performed_by || null,
+    organization_id,
   };
   const { error } = await supabase.from('activity_logs').insert([row]);
   if (error) console.error('Activity log insert failed:', error.message);
