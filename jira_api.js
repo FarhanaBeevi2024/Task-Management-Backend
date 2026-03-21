@@ -677,8 +677,29 @@ router.get('/issues', requireOrgContext, async (req, res) => {
       }
     }
     
-    const { data: issues, error } = await query.order('created_at', { ascending: false });
+    const { data: issuesRaw, error } = await query.order('created_at', { ascending: false });
     if (error) throw error;
+    let issues = issuesRaw || [];
+
+    // Project clients: To Do column only shows tasks they created (reporter / created_by).
+    if (!req.isSuperAdmin && issues.length > 0) {
+      const projectIds = [...new Set(issues.map((i) => i.project_id).filter(Boolean))];
+      const { data: memberships } = await supabaseAdmin
+        .from('project_members')
+        .select('project_id, project_role')
+        .eq('user_id', req.user.id)
+        .in('project_id', projectIds);
+      const clientProjectIds = new Set(
+        (memberships || []).filter((m) => m.project_role === 'client').map((m) => m.project_id)
+      );
+      if (clientProjectIds.size > 0) {
+        issues = issues.filter((i) => {
+          if (i.status !== 'to_do' || !clientProjectIds.has(i.project_id)) return true;
+          const creator = i.created_by || i.reporter_id;
+          return creator === req.user.id;
+        });
+      }
+    }
     
     // Get user emails from profiles
     const userIds = new Set();
@@ -701,13 +722,37 @@ router.get('/issues', requireOrgContext, async (req, res) => {
         });
       }
     }
+
+    // Who created the issue: prefer explicit created_by if column exists, else reporter_id
+    const creatorIds = [
+      ...new Set(
+        (issues || [])
+          .map((i) => i.created_by || i.reporter_id)
+          .filter(Boolean)
+      ),
+    ];
+    const creatorRoleByUserId = {};
+    if (creatorIds.length > 0) {
+      const { data: roleRows } = await supabaseAdmin
+        .from('user_roles')
+        .select('user_id, role')
+        .in('user_id', creatorIds);
+      (roleRows || []).forEach((row) => {
+        creatorRoleByUserId[row.user_id] = row.role;
+      });
+    }
     
     // Attach user info to issues
-    const issuesWithUsers = issues.map(issue => ({
-      ...issue,
-      assignee: issue.assignee_id ? profiles[issue.assignee_id] || { id: issue.assignee_id, email: 'Unknown' } : null,
-      reporter: issue.reporter_id ? profiles[issue.reporter_id] || { id: issue.reporter_id, email: 'Unknown' } : null
-    }));
+    const issuesWithUsers = issues.map(issue => {
+      const creatorId = issue.created_by || issue.reporter_id;
+      const creatorRole = creatorId ? creatorRoleByUserId[creatorId] : null;
+      return {
+        ...issue,
+        assignee: issue.assignee_id ? profiles[issue.assignee_id] || { id: issue.assignee_id, email: 'Unknown' } : null,
+        reporter: issue.reporter_id ? profiles[issue.reporter_id] || { id: issue.reporter_id, email: 'Unknown' } : null,
+        created_by_client: creatorRole === 'client',
+      };
+    });
     
     res.json(issuesWithUsers);
   } catch (error) {
@@ -730,6 +775,22 @@ router.get('/issues/:id', requireOrgContext, async (req, res) => {
       .eq('organization_id', req.organizationId)
       .single();
     if (error) throw error;
+
+    // Project clients cannot open other users' To Do tasks (only their own).
+    if (!req.isSuperAdmin) {
+      const { data: pm } = await supabaseAdmin
+        .from('project_members')
+        .select('project_role')
+        .eq('project_id', issue.project_id)
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+      if (pm?.project_role === 'client') {
+        const creator = issue.created_by || issue.reporter_id;
+        if (issue.status === 'to_do' && creator !== req.user.id) {
+          return res.status(404).json({ error: 'Issue not found' });
+        }
+      }
+    }
 
     // Load parent issue and subtasks with separate queries (avoid issues->issues schema cache error)
     let parent_issue = null;
@@ -768,6 +829,17 @@ router.get('/issues/:id', requireOrgContext, async (req, res) => {
         });
       }
     }
+
+    const creatorId = issue.created_by || issue.reporter_id;
+    let created_by_client = false;
+    if (creatorId) {
+      const { data: creatorRoleRow } = await supabaseAdmin
+        .from('user_roles')
+        .select('role')
+        .eq('user_id', creatorId)
+        .maybeSingle();
+      created_by_client = creatorRoleRow?.role === 'client';
+    }
     
     // Attach user info, parent, and subtasks
     const issueWithUsers = {
@@ -775,7 +847,8 @@ router.get('/issues/:id', requireOrgContext, async (req, res) => {
       parent_issue,
       subtasks,
       assignee: issue.assignee_id ? profiles[issue.assignee_id] || { id: issue.assignee_id, email: 'Unknown' } : null,
-      reporter: issue.reporter_id ? profiles[issue.reporter_id] || { id: issue.reporter_id, email: 'Unknown' } : null
+      reporter: issue.reporter_id ? profiles[issue.reporter_id] || { id: issue.reporter_id, email: 'Unknown' } : null,
+      created_by_client,
     };
     
     res.json(issueWithUsers);
