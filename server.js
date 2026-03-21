@@ -3,10 +3,16 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import jiraRouter from './jira_api.js';
 import superadminRouter from './superadminRoutes.js';
-import { canManageUsers, canViewAllUsers } from './accessConfig.js';
+import {
+  canManageUsers,
+  canViewAllUsers,
+  refreshRoleAccessCache,
+  getAccessConfigPayload,
+  upsertRoleAccessFromBody,
+} from './accessConfig.js';
 import { supabaseAdmin } from './supabaseAdmin.js';
 import { authenticate, loadGlobalRole } from './middleware/auth.js';
-import { requireOrgContext, requireOrgRole } from './middleware/organization.js';
+import { requireOrgContext } from './middleware/organization.js';
 
 dotenv.config();
 
@@ -28,6 +34,20 @@ const getUserRole = async (userId) => {
   if (error || !data) return 'user';
   return data.role;
 };
+
+/** Org member/invitation admin APIs: superadmin bypass; others need global `canManageUsers` from role_access_config. */
+async function requireCanManageOrgMembers(req, res, next) {
+  try {
+    if (req.isSuperAdmin) return next();
+    const globalRole = await getUserRole(req.user.id);
+    if (!canManageUsers(globalRole)) {
+      return res.status(403).json({ error: 'You do not have permission to manage organization members' });
+    }
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
 
 // Routes
 
@@ -261,7 +281,7 @@ app.patch('/api/organizations/:id', authenticate, loadGlobalRole, async (req, re
 app.get('/api/organizations/:id/members', authenticate, loadGlobalRole, (req, _res, next) => {
   req.organizationId = req.params.id;
   next();
-}, requireOrgContext, requireOrgRole(['org_admin']), async (req, res) => {
+}, requireOrgContext, requireCanManageOrgMembers, async (req, res) => {
   try {
     if (!req.isSuperAdmin && String(req.organizationId) !== String(req.params.id)) {
       return res.status(403).json({ error: 'Cannot access other organizations' });
@@ -298,7 +318,7 @@ app.get('/api/organizations/:id/members', authenticate, loadGlobalRole, (req, _r
 app.put('/api/organizations/:id/members/:userId', authenticate, loadGlobalRole, (req, _res, next) => {
   req.organizationId = req.params.id;
   next();
-}, requireOrgContext, requireOrgRole(['org_admin']), async (req, res) => {
+}, requireOrgContext, requireCanManageOrgMembers, async (req, res) => {
   try {
     if (!req.isSuperAdmin && String(req.organizationId) !== String(req.params.id)) {
       return res.status(403).json({ error: 'Cannot access other organizations' });
@@ -325,7 +345,7 @@ app.put('/api/organizations/:id/members/:userId', authenticate, loadGlobalRole, 
 app.post('/api/organizations/:id/invitations', authenticate, loadGlobalRole, (req, _res, next) => {
   req.organizationId = req.params.id;
   next();
-}, requireOrgContext, requireOrgRole(['org_admin']), async (req, res) => {
+}, requireOrgContext, requireCanManageOrgMembers, async (req, res) => {
   try {
     if (!req.isSuperAdmin && String(req.organizationId) !== String(req.params.id)) {
       return res.status(403).json({ error: 'Cannot access other organizations' });
@@ -358,7 +378,7 @@ app.post('/api/organizations/:id/invitations', authenticate, loadGlobalRole, (re
 app.get('/api/organizations/:id/invitations', authenticate, loadGlobalRole, (req, _res, next) => {
   req.organizationId = req.params.id;
   next();
-}, requireOrgContext, requireOrgRole(['org_admin']), async (req, res) => {
+}, requireOrgContext, requireCanManageOrgMembers, async (req, res) => {
   try {
     if (!req.isSuperAdmin && String(req.organizationId) !== String(req.params.id)) {
       return res.status(403).json({ error: 'Cannot access other organizations' });
@@ -398,6 +418,10 @@ app.get('/api/users', authenticate, loadGlobalRole, requireOrgContext, async (re
       return res.json(users);
     }
 
+    if (!req.isSuperAdmin && !canViewAllUsers(userRole) && !canManageUsers(userRole)) {
+      return res.status(403).json({ error: 'You do not have permission to list organization users' });
+    }
+
     // Org-scoped list: members of this org only
     const { data: members, error: membersError } = await supabaseAdmin
       .from('organization_members')
@@ -424,6 +448,33 @@ app.get('/api/users', authenticate, loadGlobalRole, requireOrgContext, async (re
       org_role: orgRoleById.get(id) || null,
       active: globalById.get(id)?.is_active !== false,
     })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Role access matrix (for UI + permission checks; stored in role_access_config)
+app.get('/api/access-config', authenticate, (req, res) => {
+  try {
+    res.json(getAccessConfigPayload());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/role-access', authenticate, loadGlobalRole, async (req, res) => {
+  try {
+    const currentUserRole = await getUserRole(req.user.id);
+    if (!canManageUsers(currentUserRole)) {
+      return res.status(403).json({ error: 'You do not have permission to edit role access' });
+    }
+    const body = req.body || {};
+    if (!body.roles || typeof body.roles !== 'object') {
+      return res.status(400).json({ error: 'Expected JSON body: { roles: { [roleKey]: { global, project } } }' });
+    }
+    await upsertRoleAccessFromBody(body.roles);
+    await refreshRoleAccessCache();
+    res.json(getAccessConfigPayload());
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -487,7 +538,16 @@ app.put('/api/admin/users/:userId/active', authenticate, loadGlobalRole, async (
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+async function startServer() {
+  try {
+    await refreshRoleAccessCache();
+  } catch (err) {
+    console.error('Failed to load role_access_config (using defaults):', err?.message || err);
+  }
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();
 

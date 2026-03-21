@@ -67,16 +67,6 @@ export async function requireOrgContext(req, res, next) {
   next();
 }
 
-export function requireOrgRole(allowed) {
-  const allowedSet = new Set(Array.isArray(allowed) ? allowed : [allowed]);
-  return (req, res, next) => {
-    if (req.isSuperAdmin) return next();
-    if (!req.orgRole) return res.status(500).json({ error: 'orgRole missing (check middleware order)' });
-    if (!allowedSet.has(req.orgRole)) return res.status(403).json({ error: 'Insufficient organization permissions' });
-    next();
-  };
-}
-
 export async function attachOrgFromProject(req, res, next) {
   const projectId = req.params.id || req.params.projectId || req.query.project_id || req.body?.project_id;
   if (!projectId) return res.status(400).json({ error: 'project_id is required' });
