@@ -10,6 +10,10 @@ import {
   canViewAllProjects,
 } from './accessConfig.js';
 import { logActivity, logIssueChanges } from './activityLogger.js';
+import {
+  DEFAULT_WORKFLOW_STATUS,
+  validateWorkflowStatus,
+} from './workflowStatus.js';
 import { authenticate, loadGlobalRole } from './middleware/auth.js';
 import {
   requireOrgContext,
@@ -1033,7 +1037,8 @@ router.post('/issues', requireOrgContext, async (req, res) => {
       due_date,
       estimated_days,
       actual_days,
-      exposed_to_client
+      exposed_to_client,
+      workflow_status,
     } = req.body;
 
     if (!project_id) {
@@ -1063,6 +1068,13 @@ router.post('/issues', requireOrgContext, async (req, res) => {
     if (priorityMap[finalInternalPriority]) {
       finalInternalPriority = priorityMap[finalInternalPriority];
     }
+
+    let finalWorkflowStatus = DEFAULT_WORKFLOW_STATUS;
+    if (workflow_status !== undefined && workflow_status !== null && workflow_status !== '') {
+      const wv = validateWorkflowStatus(workflow_status);
+      if (!wv.ok) return res.status(400).json({ error: wv.error });
+      finalWorkflowStatus = wv.value;
+    }
     
     const { data: issue, error } = await supabaseAdmin
       .from('issues')
@@ -1087,7 +1099,8 @@ router.post('/issues', requireOrgContext, async (req, res) => {
         due_date,
         estimated_days: estimated_days != null ? parseInt(estimated_days, 10) : null,
         actual_days: actual_days != null ? parseInt(actual_days, 10) : null,
-        exposed_to_client: exposed_to_client === true || exposed_to_client === 'true'
+        exposed_to_client: exposed_to_client === true || exposed_to_client === 'true',
+        workflow_status: finalWorkflowStatus,
       }])
       .select('*')
       .single();
@@ -1249,13 +1262,18 @@ router.put('/issues/:id', requireOrgContext, async (req, res) => {
     
     // Team members can update internal_priority and status
     if (userRole === 'team_member') {
-      const allowedFields = ['status', 'internal_priority'];
+      const allowedFields = ['status', 'internal_priority', 'workflow_status'];
       const updateData = {};
       allowedFields.forEach(field => {
         if (req.body[field] !== undefined) {
           updateData[field] = req.body[field];
         }
       });
+      if (updateData.workflow_status !== undefined) {
+        const wv = validateWorkflowStatus(updateData.workflow_status);
+        if (!wv.ok) return res.status(400).json({ error: wv.error });
+        updateData.workflow_status = wv.value;
+      }
       
       // Can only update if assigned to them or created by them
       if (currentIssue.assignee_id !== req.user.id && currentIssue.reporter_id !== req.user.id) {
@@ -1323,6 +1341,10 @@ router.put('/issues/:id', requireOrgContext, async (req, res) => {
       if (req.body.summary !== undefined) safe.summary = req.body.summary;
       if (req.body.description !== undefined) safe.description = req.body.description;
       if (req.body.status !== undefined) safe.status = req.body.status;
+      if (req.body.workflow_status !== undefined) {
+        const wv = validateWorkflowStatus(req.body.workflow_status);
+        if (wv.ok) safe.workflow_status = wv.value;
+      }
       if (req.body.story_points !== undefined) safe.story_points = req.body.story_points;
       if (req.body.labels !== undefined) safe.labels = req.body.labels;
       if (req.body.due_date !== undefined) safe.due_date = req.body.due_date;
@@ -1345,6 +1367,12 @@ router.put('/issues/:id', requireOrgContext, async (req, res) => {
     if (req.body.milestone_id !== undefined) updatesForLog.milestone_id = req.body.milestone_id || null;
     if (req.body.summary !== undefined) updatesForLog.summary = req.body.summary;
     if (req.body.description !== undefined) updatesForLog.description = req.body.description;
+    if (req.body.workflow_status !== undefined) {
+      const wv = validateWorkflowStatus(req.body.workflow_status);
+      if (!wv.ok) return res.status(400).json({ error: wv.error });
+      req.body.workflow_status = wv.value;
+      updatesForLog.workflow_status = wv.value;
+    }
     await logIssueChanges(supabaseAdmin, req.params.id, currentIssue, updatesForLog, req.user.id);
 
     let result = await supabaseAdmin

@@ -57,6 +57,14 @@ export async function logIssueChanges(supabase, issueId, oldIssue, updates, perf
   if (updates.description !== undefined && String(oldIssue?.description || '') !== String(updates.description ?? '')) {
     actions.push({ action_type: 'DESCRIPTION_CHANGE', field_name: 'description', old_value: oldIssue?.description, new_value: updates.description });
   }
+  if (updates.workflow_status !== undefined && String(oldIssue?.workflow_status || '') !== String(updates.workflow_status ?? '')) {
+    actions.push({
+      action_type: 'UPDATE',
+      field_name: 'workflow_status',
+      old_value: oldIssue?.workflow_status,
+      new_value: updates.workflow_status,
+    });
+  }
   for (const { action_type, field_name, old_value, new_value } of actions) {
     await logActivity(supabase, {
       entity_type: 'TASK',
