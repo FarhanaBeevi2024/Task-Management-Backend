@@ -3,6 +3,18 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import jiraRouter from './jira_api.js';
 import superadminRouter from './superadminRoutes.js';
+import publicInviteRouter from './publicInviteRoutes.js';
+import { generateInviteToken, inviteSignupUrl } from './inviteHelpers.js';
+import {
+  findAuthUserIdByNormalizedEmail,
+  ensureOrganizationMember,
+} from './orgMembershipHelpers.js';
+import {
+  workspaceRoleFromOrgMember,
+  workspaceRoleToOrgMemberRole,
+  userRoleFromOrgMemberRole,
+  inviteWorkspaceRoleToOrgRole,
+} from './roleWorkspace.js';
 import {
   canManageUsers,
   canViewAllUsers,
@@ -22,6 +34,7 @@ const PORT = process.env.PORT || 3001;
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use('/api/public', publicInviteRouter);
 
 // Get user role
 const getUserRole = async (userId) => {
@@ -35,15 +48,34 @@ const getUserRole = async (userId) => {
   return data.role;
 };
 
-/** Org member/invitation admin APIs: superadmin bypass; others need global `canManageUsers` from role_access_config. */
+async function isOrgAdminUser(userId, organizationId) {
+  if (!organizationId) return false;
+  const { data: m } = await supabaseAdmin
+    .from('organization_members')
+    .select('role')
+    .eq('organization_id', organizationId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  return m?.role === 'admin';
+}
+
+/** User directory + invites: superadmin, global canManageUsers, or org workspace admin. */
+async function canManageOrgDirectory(req) {
+  if (req.isSuperAdmin) return true;
+  const globalRole = await getUserRole(req.user.id);
+  if (canManageUsers(globalRole)) return true;
+  if (await isOrgAdminUser(req.user.id, req.organizationId)) return true;
+  return false;
+}
+
+/** Org member/invitation admin APIs: superadmin bypass; global canManageUsers; or org admin. */
 async function requireCanManageOrgMembers(req, res, next) {
   try {
     if (req.isSuperAdmin) return next();
     const globalRole = await getUserRole(req.user.id);
-    if (!canManageUsers(globalRole)) {
-      return res.status(403).json({ error: 'You do not have permission to manage organization members' });
-    }
-    next();
+    if (canManageUsers(globalRole)) return next();
+    if (await isOrgAdminUser(req.user.id, req.organizationId)) return next();
+    return res.status(403).json({ error: 'You do not have permission to manage organization members' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -222,13 +254,67 @@ app.delete('/api/tasks/:id', authenticate, loadGlobalRole, async (req, res) => {
 app.get('/api/user', authenticate, loadGlobalRole, async (req, res) => {
   try {
     const role = await getUserRole(req.user.id);
+
+    // Profiles may not have first/last columns in older DBs; don't block /api/user.
+    let firstName = null;
+    let lastName = null;
+    try {
+      const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('first_name, last_name')
+        .eq('id', req.user.id)
+        .maybeSingle();
+      firstName = profile?.first_name ?? null;
+      lastName = profile?.last_name ?? null;
+    } catch {
+      // Ignore profile projection errors; keep null names.
+    }
+    let orgMemberRole = null;
+    const orgHeader = (req.headers['x-organization-id'] || '').trim();
+    if (orgHeader && !req.isSuperAdmin) {
+      const { data: om } = await supabaseAdmin
+        .from('organization_members')
+        .select('role')
+        .eq('organization_id', orgHeader)
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+      orgMemberRole = om?.role ?? null;
+    }
+
     res.json({
       id: req.user.id,
       email: req.user.email,
       role: role,
+      first_name: firstName,
+      last_name: lastName,
+      org_member_role: orgMemberRole,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+/** Organizations the current user belongs to (for workspace switcher). */
+app.get('/api/me/organizations', authenticate, loadGlobalRole, async (req, res) => {
+  try {
+    if (req.isSuperAdmin) {
+      return res.json({ organizations: [], is_superadmin: true });
+    }
+    const { data, error } = await supabaseAdmin
+      .from('organization_members')
+      .select('organization_id, role, organizations:organization_id(id, name, status)')
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    const orgs = (data || [])
+      .filter((m) => m.organizations?.status === 'active')
+      .map((m) => ({
+        id: m.organization_id,
+        name: m.organizations?.name || 'Organization',
+        org_role: m.role,
+      }));
+    res.json({ organizations: orgs, is_superadmin: false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -279,7 +365,7 @@ app.patch('/api/organizations/:id', authenticate, loadGlobalRole, async (req, re
 
 // Org Admin: list members
 app.get('/api/organizations/:id/members', authenticate, loadGlobalRole, (req, _res, next) => {
-  req.organizationId = req.params.id;
+  req.orgIdFromRoute = req.params.id;
   next();
 }, requireOrgContext, requireCanManageOrgMembers, async (req, res) => {
   try {
@@ -301,22 +387,26 @@ app.get('/api/organizations/:id/members', authenticate, loadGlobalRole, (req, _r
     const emailById = new Map((profiles || []).map((p) => [p.id, p.email]));
     const globalById = new Map((roles || []).map((r) => [r.user_id, r]));
 
-    res.json((members || []).map((m) => ({
-      user_id: m.user_id,
-      email: emailById.get(m.user_id) || 'Unknown',
-      org_role: m.role,
-      joined_at: m.joined_at,
-      global_role: globalById.get(m.user_id)?.role || 'user',
-      active: globalById.get(m.user_id)?.is_active !== false,
-    })));
+    res.json((members || []).map((m) => {
+      const gr = globalById.get(m.user_id)?.role || 'user';
+      return {
+        user_id: m.user_id,
+        email: emailById.get(m.user_id) || 'Unknown',
+        org_role: m.role,
+        joined_at: m.joined_at,
+        workspace_role: workspaceRoleFromOrgMember(m.role, gr),
+        global_role: gr,
+        active: globalById.get(m.user_id)?.is_active !== false,
+      };
+    }));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Org Admin: update a member's org role (org_admin/team_leader/team_member/client)
+// Org Admin: workspace role as organization_members (admin | team_member) + user_roles (admin | user)
 app.put('/api/organizations/:id/members/:userId', authenticate, loadGlobalRole, (req, _res, next) => {
-  req.organizationId = req.params.id;
+  req.orgIdFromRoute = req.params.id;
   next();
 }, requireOrgContext, requireCanManageOrgMembers, async (req, res) => {
   try {
@@ -324,7 +414,7 @@ app.put('/api/organizations/:id/members/:userId', authenticate, loadGlobalRole, 
       return res.status(403).json({ error: 'Cannot access other organizations' });
     }
     const { role } = req.body || {};
-    const allowed = ['org_admin', 'team_leader', 'team_member', 'client'];
+    const allowed = ['admin', 'team_member'];
     if (!allowed.includes(role)) return res.status(400).json({ error: 'Invalid role' });
 
     const { data, error } = await supabaseAdmin
@@ -335,15 +425,121 @@ app.put('/api/organizations/:id/members/:userId', authenticate, loadGlobalRole, 
       .select('organization_id, user_id, role')
       .single();
     if (error) throw error;
+
+    const ur = userRoleFromOrgMemberRole(role);
+    await supabaseAdmin
+      .from('user_roles')
+      .upsert(
+        { user_id: req.params.userId, role: ur, is_active: true },
+        { onConflict: 'user_id' }
+      );
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Org Admin: create invitation
+async function createOrgInvitationRecord({
+  organizationId,
+  emailRaw,
+  orgRole,
+  invitedByUserId,
+}) {
+  const email = String(emailRaw || '').trim().toLowerCase();
+  if (!email || !email.includes('@')) {
+    const err = new Error('Valid email required');
+    err.statusCode = 400;
+    throw err;
+  }
+  const role = inviteWorkspaceRoleToOrgRole(orgRole);
+
+  // Existing portal user: add to this workspace directly (no signup link / email mismatch).
+  const existingUserId = await findAuthUserIdByNormalizedEmail(email);
+  if (existingUserId) {
+    const { data: inOrg, error: inOrgErr } = await supabaseAdmin
+      .from('organization_members')
+      .select('user_id')
+      .eq('organization_id', organizationId)
+      .eq('user_id', existingUserId)
+      .maybeSingle();
+    if (inOrgErr) throw inOrgErr;
+    if (inOrg) {
+      const err = new Error('This user is already a member of this organization');
+      err.statusCode = 409;
+      throw err;
+    }
+    await supabaseAdmin.from('profiles').upsert(
+      { id: existingUserId, email },
+      { onConflict: 'id' }
+    );
+    await ensureOrganizationMember({
+      organizationId,
+      userId: existingUserId,
+      orgMemberRole: role,
+    });
+    await supabaseAdmin
+      .from('organization_invitations')
+      .delete()
+      .eq('organization_id', organizationId)
+      .eq('email', email);
+    return {
+      added_existing_user: true,
+      user_id: existingUserId,
+      email,
+      organization_id: organizationId,
+      role,
+      signup_url: null,
+      email_send_error: null,
+    };
+  }
+
+  const token = generateInviteToken();
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  await supabaseAdmin
+    .from('organization_invitations')
+    .delete()
+    .eq('organization_id', organizationId)
+    .eq('email', email);
+
+  const { data, error } = await supabaseAdmin
+    .from('organization_invitations')
+    .insert([{
+      organization_id: organizationId,
+      email,
+      role,
+      invitation_token: token,
+      invited_by: invitedByUserId,
+      status: 'pending',
+      expires_at: expiresAt,
+    }])
+    .select('*')
+    .single();
+  if (error) throw error;
+
+  // Send Supabase-managed invite email (user will complete password on Supabase).
+  // Note: Supabase's default inbuilt SMTP may only send to pre-authorized team addresses.
+  let emailSendError = null;
+  try {
+    await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+      redirectTo: inviteSignupUrl(token),
+      data: { invitation_token: token, organization_id: organizationId },
+    });
+  } catch (e) {
+    console.error('Failed to send Supabase invite email:', e?.message || e);
+    emailSendError = e?.message || String(e);
+  }
+
+  return {
+    ...data,
+    signup_url: inviteSignupUrl(token),
+    email_send_error: emailSendError,
+  };
+}
+
+// Org Admin: create invitation (signup link + email in response; configure SMTP separately for real email)
 app.post('/api/organizations/:id/invitations', authenticate, loadGlobalRole, (req, _res, next) => {
-  req.organizationId = req.params.id;
+  req.orgIdFromRoute = req.params.id;
   next();
 }, requireOrgContext, requireCanManageOrgMembers, async (req, res) => {
   try {
@@ -351,32 +547,39 @@ app.post('/api/organizations/:id/invitations', authenticate, loadGlobalRole, (re
       return res.status(403).json({ error: 'Cannot access other organizations' });
     }
     const { email, role } = req.body || {};
-    const allowed = ['org_admin', 'team_leader', 'team_member', 'client'];
-    if (!email || !String(email).includes('@')) return res.status(400).json({ error: 'Valid email required' });
-    if (role && !allowed.includes(role)) return res.status(400).json({ error: 'Invalid role' });
-
-    const { data, error } = await supabaseAdmin
-      .from('organization_invitations')
-      .insert([{
-        organization_id: req.organizationId,
-        email: String(email).toLowerCase(),
-        role: role || 'team_member',
-        invited_by: req.user.id,
-        status: 'pending',
-        expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), // 7 days
-      }])
-      .select('*')
-      .single();
-    if (error) throw error;
-    res.status(201).json(data);
+    const row = await createOrgInvitationRecord({
+      organizationId: req.organizationId,
+      emailRaw: email,
+      orgRole: role,
+      invitedByUserId: req.user.id,
+    });
+    res.status(201).json(row);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    const code = e.statusCode || 500;
+    res.status(code).json({ error: e.message });
+  }
+});
+
+// Same as POST /api/organizations/:id/invitations but uses active org from X-Organization-Id (Users page).
+app.post('/api/organization/invitations', authenticate, loadGlobalRole, requireOrgContext, requireCanManageOrgMembers, async (req, res) => {
+  try {
+    const { email, role } = req.body || {};
+    const row = await createOrgInvitationRecord({
+      organizationId: req.organizationId,
+      emailRaw: email,
+      orgRole: role,
+      invitedByUserId: req.user.id,
+    });
+    res.status(201).json(row);
+  } catch (e) {
+    const code = e.statusCode || 500;
+    res.status(code).json({ error: e.message });
   }
 });
 
 // Org Admin: list invitations (pending/accepted/expired)
 app.get('/api/organizations/:id/invitations', authenticate, loadGlobalRole, (req, _res, next) => {
-  req.organizationId = req.params.id;
+  req.orgIdFromRoute = req.params.id;
   next();
 }, requireOrgContext, requireCanManageOrgMembers, async (req, res) => {
   try {
@@ -413,23 +616,59 @@ app.get('/api/users', authenticate, loadGlobalRole, requireOrgContext, async (re
       const roleByUserId = new Map(userRoles.map((ur) => [ur.user_id, ur]));
       const users = profiles.map((p) => {
         const ur = roleByUserId.get(p.id);
-        return { user_id: p.id, email: p.email || 'Unknown', role: ur?.role || 'user', active: ur?.is_active !== false };
+        return {
+          user_id: p.id,
+          email: p.email || 'Unknown',
+          role: ur?.role || 'user',
+          active: ur?.is_active !== false,
+          pending_org_membership: false,
+        };
       });
       return res.json(users);
     }
 
-    if (!req.isSuperAdmin && !canViewAllUsers(userRole) && !canManageUsers(userRole)) {
+    if (!req.isSuperAdmin && !canViewAllUsers(userRole) && !(await canManageOrgDirectory(req))) {
       return res.status(403).json({ error: 'You do not have permission to list organization users' });
     }
 
-    // Org-scoped list: members of this org only
+    // Org-scoped list: members of this org. If user can manage users, also include accounts
+    // that have signed up (profiles) but are not in organization_members yet — otherwise
+    // self-service signups never appear in the Users UI.
     const { data: members, error: membersError } = await supabaseAdmin
       .from('organization_members')
       .select('user_id, role')
       .eq('organization_id', req.organizationId);
     if (membersError) throw membersError;
 
-    const userIds = (members || []).map((m) => m.user_id);
+    const memberIds = (members || []).map((m) => m.user_id);
+    const orgRoleById = new Map((members || []).map((m) => [m.user_id, m.role]));
+
+    let userIds = [...memberIds];
+    // Only for User Management: signed-up profiles with no org would pollute assignee
+    // dropdowns if we always merged them into GET /api/users.
+    const wantPendingSignups =
+      String(req.query?.include_pending_signups || '') === '1' ||
+      String(req.query?.include_pending_signups || '').toLowerCase() === 'true';
+    if (wantPendingSignups && (await canManageOrgDirectory(req))) {
+      const { data: anyMemberships, error: anyMemErr } = await supabaseAdmin
+        .from('organization_members')
+        .select('user_id');
+      if (anyMemErr) throw anyMemErr;
+      const inAnyOrganization = new Set((anyMemberships || []).map((m) => m.user_id));
+      const { data: allProfiles, error: allProfilesError } = await supabaseAdmin
+        .from('profiles')
+        .select('id, email');
+      if (allProfilesError) throw allProfilesError;
+      const orphanIds = (allProfiles || [])
+        .filter((p) => p.id && !inAnyOrganization.has(p.id))
+        .map((p) => p.id);
+      userIds = [...new Set([...memberIds, ...orphanIds])];
+    }
+
+    if (userIds.length === 0) {
+      return res.json([]);
+    }
+
     const [{ data: profiles, error: profilesError }, { data: userRoles, error: rolesError }] = await Promise.all([
       supabaseAdmin.from('profiles').select('id, email').in('id', userIds),
       supabaseAdmin.from('user_roles').select('user_id, role, is_active').in('user_id', userIds),
@@ -439,17 +678,75 @@ app.get('/api/users', authenticate, loadGlobalRole, requireOrgContext, async (re
 
     const emailById = new Map((profiles || []).map((p) => [p.id, p.email]));
     const globalById = new Map((userRoles || []).map((r) => [r.user_id, r]));
-    const orgRoleById = new Map((members || []).map((m) => [m.user_id, m.role]));
 
-    res.json(userIds.map((id) => ({
-      user_id: id,
-      email: emailById.get(id) || 'Unknown',
-      role: globalById.get(id)?.role || 'user',
-      org_role: orgRoleById.get(id) || null,
-      active: globalById.get(id)?.is_active !== false,
-    })));
+    const rows = userIds.map((id) => {
+      const orgRole = orgRoleById.get(id) ?? null;
+      const gr = globalById.get(id)?.role || 'user';
+      const workspaceRole = orgRole != null
+        ? workspaceRoleFromOrgMember(orgRole, gr)
+        : workspaceRoleFromOrgMember(null, gr);
+      return {
+        user_id: id,
+        email: emailById.get(id) || 'Unknown',
+        role: workspaceRole,
+        active: globalById.get(id)?.is_active !== false,
+        pending_org_membership: !orgRoleById.has(id),
+      };
+    }).filter((row) => {
+      // Non-superadmins shouldn't see other superadmin accounts in Users UI.
+      if (req.isSuperAdmin) return true;
+      return row.role !== 'superadmin';
+    });
+    rows.sort((a, b) => String(a.email || '').localeCompare(String(b.email || ''), undefined, { sensitivity: 'base' }));
+    res.json(rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Add a user who already has auth + profiles row but no organization_members row
+ * into the caller's organization (typical self-signup onboarding).
+ */
+app.post('/api/organization/add-member', authenticate, loadGlobalRole, requireOrgContext, async (req, res) => {
+  try {
+    if (req.isSuperAdmin) {
+      return res.status(400).json({ error: 'Superadmin: use organization-specific member APIs' });
+    }
+    if (!(await canManageOrgDirectory(req))) {
+      return res.status(403).json({ error: 'You do not have permission to add organization members' });
+    }
+    const { user_id: userId, org_role: orgRoleBody } = req.body || {};
+    if (!userId) return res.status(400).json({ error: 'user_id is required' });
+    const orgRole = inviteWorkspaceRoleToOrgRole(orgRoleBody);
+
+    const { data: alreadyHere, error: hereErr } = await supabaseAdmin
+      .from('organization_members')
+      .select('organization_id, user_id, role')
+      .eq('organization_id', req.organizationId)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (hereErr) throw hereErr;
+    if (alreadyHere) {
+      return res.status(409).json({ error: 'This user is already a member of this organization' });
+    }
+
+    await ensureOrganizationMember({
+      organizationId: req.organizationId,
+      userId,
+      orgMemberRole: orgRole,
+    });
+
+    const { data, error } = await supabaseAdmin
+      .from('organization_members')
+      .select('organization_id, user_id, role')
+      .eq('organization_id', req.organizationId)
+      .eq('user_id', userId)
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -481,19 +778,23 @@ app.put('/api/admin/role-access', authenticate, loadGlobalRole, async (req, res)
 });
 
 // ====== ADMIN: Manage user roles (gated by accessConfig) ======
-app.put('/api/admin/users/:userId/role', authenticate, loadGlobalRole, async (req, res) => {
+app.put('/api/admin/users/:userId/role', authenticate, loadGlobalRole, requireOrgContext, async (req, res) => {
   try {
-    const currentUserRole = await getUserRole(req.user.id);
-    if (!canManageUsers(currentUserRole)) {
-      return res.status(403).json({ error: 'Only users with canManageUsers can change roles' });
+    if (!(await canManageOrgDirectory(req))) {
+      return res.status(403).json({ error: 'You do not have permission to change user roles' });
     }
 
     const { role } = req.body;
-    const allowedRoles = ['user', 'team_member', 'team_leader', 'client', 'admin', 'superadmin'];
-
-    if (!allowedRoles.includes(role)) {
-      return res.status(400).json({ error: 'Invalid role value' });
+    if (role !== 'admin' && role !== 'user') {
+      return res.status(400).json({ error: 'Role must be admin or user' });
     }
+
+    const targetGlobal = await getUserRole(req.params.userId);
+    if (targetGlobal === 'superadmin') {
+      return res.status(403).json({ error: 'Cannot change superadmin role here' });
+    }
+
+    const orgMemberRole = workspaceRoleToOrgMemberRole(role);
 
     const { data, error } = await supabaseAdmin
       .from('user_roles')
@@ -506,6 +807,12 @@ app.put('/api/admin/users/:userId/role', authenticate, loadGlobalRole, async (re
 
     if (error) throw error;
 
+    await supabaseAdmin
+      .from('organization_members')
+      .update({ role: orgMemberRole })
+      .eq('organization_id', req.organizationId)
+      .eq('user_id', req.params.userId);
+
     res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -513,24 +820,41 @@ app.put('/api/admin/users/:userId/role', authenticate, loadGlobalRole, async (re
 });
 
 // ====== ADMIN: Activate/deactivate users (gated by accessConfig) ======
-app.put('/api/admin/users/:userId/active', authenticate, loadGlobalRole, async (req, res) => {
+app.put('/api/admin/users/:userId/active', authenticate, loadGlobalRole, requireOrgContext, async (req, res) => {
   try {
-    const currentUserRole = await getUserRole(req.user.id);
-    if (!canManageUsers(currentUserRole)) {
-      return res.status(403).json({ error: 'Only users with canManageUsers can change user status' });
+    if (!(await canManageOrgDirectory(req))) {
+      return res.status(403).json({ error: 'You do not have permission to change user status' });
     }
 
     const { active } = req.body;
     const value = active === false ? false : true;
 
-    const { data, error } = await supabaseAdmin
+    const { data: existingRow, error: fetchErr } = await supabaseAdmin
       .from('user_roles')
-      .update({ is_active: value })
+      .select('user_id, role')
       .eq('user_id', req.params.userId)
-      .select('user_id, is_active')
-      .single();
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
 
-    if (error) throw error;
+    let data;
+    if (!existingRow) {
+      const ins = await supabaseAdmin
+        .from('user_roles')
+        .insert([{ user_id: req.params.userId, role: 'user', is_active: value }])
+        .select('user_id, is_active')
+        .single();
+      if (ins.error) throw ins.error;
+      data = ins.data;
+    } else {
+      const upd = await supabaseAdmin
+        .from('user_roles')
+        .update({ is_active: value })
+        .eq('user_id', req.params.userId)
+        .select('user_id, is_active')
+        .single();
+      if (upd.error) throw upd.error;
+      data = upd.data;
+    }
 
     res.json(data);
   } catch (error) {

@@ -13,6 +13,8 @@ import { logActivity, logIssueChanges } from './activityLogger.js';
 import {
   DEFAULT_WORKFLOW_STATUS,
   validateWorkflowStatus,
+  defaultWorkflowForBoardStatus,
+  coerceWorkflowForBoardStatus,
 } from './workflowStatus.js';
 import { authenticate, loadGlobalRole } from './middleware/auth.js';
 import {
@@ -21,8 +23,38 @@ import {
   attachOrgFromIssue,
   requireSameOrganizationForResource,
 } from './middleware/organization.js';
+import { workspaceRoleFromOrgMember } from './roleWorkspace.js';
+import { ensureOrganizationMember } from './orgMembershipHelpers.js';
 
 const router = express.Router();
+
+/** Normalize UUID strings for consistent Map keys (Supabase may vary casing). */
+function uuidKeyPart(v) {
+  if (v == null || v === '') return '';
+  return String(v).trim().toLowerCase();
+}
+
+function issueCreatorClientMapKey(projectId, userId) {
+  const p = uuidKeyPart(projectId);
+  const u = uuidKeyPart(userId);
+  if (!p || !u) return '';
+  return `${p}:${u}`;
+}
+
+function isClientProjectMemberRole(role) {
+  return String(role || '').trim().toLowerCase() === 'client';
+}
+
+/** Prefer reporter (who filed the task); matches client-created tasks on POST /issues. */
+function issueCreatorUserId(issue) {
+  if (!issue) return null;
+  return issue.reporter_id || issue.created_by || null;
+}
+
+function issueProjectIdForCreator(issue) {
+  if (!issue) return null;
+  return issue.project_id ?? issue.project?.id ?? null;
+}
 
 // Helper function to get user role
 const getUserRole = async (userId) => {
@@ -35,6 +67,49 @@ const getUserRole = async (userId) => {
   if (error || !data) return 'user';
   return data.role;
 };
+
+/** Global role config OR project team_leader / project admin */
+async function resolveCanManageProjectMembers(userId, projectId, globalRole) {
+  if (canManageProjectMembers(globalRole)) return true;
+  if (!projectId) return false;
+  const { data: pm } = await supabaseAdmin
+    .from('project_members')
+    .select('project_role')
+    .eq('project_id', projectId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  const pr = pm?.project_role;
+  return pr === 'team_leader' || pr === 'admin';
+}
+
+function defaultProjectRoleForCreator(globalRole) {
+  if (globalRole === 'admin' || globalRole === 'superadmin') return 'admin';
+  if (globalRole === 'team_leader') return 'team_leader';
+  return 'team_member';
+}
+
+async function canManageClientsResource(userId, organizationId, globalRole) {
+  if (canManageProjectMembers(globalRole)) return true;
+  const { data: om } = await supabaseAdmin
+    .from('organization_members')
+    .select('role')
+    .eq('organization_id', organizationId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (om?.role === 'admin') return true;
+  const { data: projects } = await supabaseAdmin
+    .from('projects')
+    .select('id')
+    .eq('organization_id', organizationId);
+  const ids = (projects || []).map((p) => p.id);
+  if (ids.length === 0) return false;
+  const { data: pms } = await supabaseAdmin
+    .from('project_members')
+    .select('project_role')
+    .eq('user_id', userId)
+    .in('project_id', ids);
+  return (pms || []).some((pm) => pm.project_role === 'team_leader' || pm.project_role === 'admin');
+}
 
 /** Project in org + (member OR global canViewAllProjects). */
 async function userHasProjectAccess(userId, organizationId, projectId, globalRole) {
@@ -189,7 +264,7 @@ router.post('/projects', requireOrgContext, async (req, res) => {
             {
               project_id: project.id,
               user_id: req.user.id,
-              project_role: userRole,
+              project_role: defaultProjectRoleForCreator(userRole),
             },
             { onConflict: 'project_id,user_id' }
           );
@@ -252,7 +327,7 @@ router.get('/projects/:id', requireOrgContext, attachOrgFromProject, requireSame
 router.put('/projects/:id', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
-    if (!canManageProjectMembers(userRole)) {
+    if (!(await resolveCanManageProjectMembers(req.user.id, req.params.id, userRole))) {
       return res.status(403).json({ error: 'You do not have permission to update this project' });
     }
 
@@ -293,7 +368,7 @@ router.put('/projects/:id', requireOrgContext, attachOrgFromProject, requireSame
 router.delete('/projects/:id', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
-    if (!canManageProjectMembers(userRole)) {
+    if (!(await resolveCanManageProjectMembers(req.user.id, req.params.id, userRole))) {
       return res.status(403).json({ error: 'You do not have permission to delete projects' });
     }
     const projectId = req.params.id;
@@ -401,7 +476,10 @@ router.get('/projects/:id/members', requireOrgContext, attachOrgFromProject, req
       .eq('project_id', req.params.id)
       .eq('user_id', req.user.id)
       .maybeSingle();
-    if (!callerMember && !canManageProjectMembers(userRole)) {
+    if (
+      !callerMember &&
+      !(await resolveCanManageProjectMembers(req.user.id, req.params.id, userRole))
+    ) {
       return res.status(404).json({ error: 'Project not found or access denied' });
     }
 
@@ -418,7 +496,7 @@ router.get('/projects/:id/members', requireOrgContext, attachOrgFromProject, req
 
     const userIds = memberships.map((m) => m.user_id);
 
-    const [{ data: profiles, error: profilesError }, { data: roles, error: rolesError }] =
+    const [{ data: profiles, error: profilesError }, { data: roles, error: rolesError }, { data: orgMembers, error: orgMemErr }] =
       await Promise.all([
         supabaseAdmin
           .from('profiles')
@@ -428,21 +506,32 @@ router.get('/projects/:id/members', requireOrgContext, attachOrgFromProject, req
           .from('user_roles')
           .select('user_id, role')
           .in('user_id', userIds),
+        supabaseAdmin
+          .from('organization_members')
+          .select('user_id, role')
+          .eq('organization_id', req.organizationId)
+          .in('user_id', userIds),
       ]);
 
     if (profilesError) throw profilesError;
     if (rolesError) throw rolesError;
+    if (orgMemErr) throw orgMemErr;
 
     const emailById = new Map((profiles || []).map((p) => [p.id, p.email]));
     const globalRoleById = new Map((roles || []).map((r) => [r.user_id, r.role]));
+    const orgRoleById = new Map((orgMembers || []).map((r) => [r.user_id, r.role]));
 
-    const result = memberships.map((m) => ({
-      project_id: m.project_id,
-      user_id: m.user_id,
-      project_role: m.project_role,
-      email: emailById.get(m.user_id) || 'Unknown',
-      global_role: globalRoleById.get(m.user_id) || 'user',
-    }));
+    const result = memberships.map((m) => {
+      const gr = globalRoleById.get(m.user_id) || 'user';
+      const om = orgRoleById.get(m.user_id) ?? null;
+      return {
+        project_id: m.project_id,
+        user_id: m.user_id,
+        project_role: m.project_role,
+        email: emailById.get(m.user_id) || 'Unknown',
+        workspace_role: workspaceRoleFromOrgMember(om, gr),
+      };
+    });
 
     res.json(result);
   } catch (error) {
@@ -454,16 +543,22 @@ router.get('/projects/:id/members', requireOrgContext, attachOrgFromProject, req
 router.post('/projects/:id/members', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
-    if (!canManageProjectMembers(userRole)) {
+    if (!(await resolveCanManageProjectMembers(req.user.id, req.params.id, userRole))) {
       return res.status(403).json({ error: 'You do not have permission to manage project members' });
     }
 
     const { user_id, project_role } = req.body;
-    const allowedProjectRoles = ['superadmin', 'admin', 'team_leader', 'team_member', 'client', 'viewer'];
+    const allowedProjectRoles = ['admin', 'team_leader', 'team_member', 'client'];
 
     if (!user_id || !allowedProjectRoles.includes(project_role)) {
       return res.status(400).json({ error: 'Invalid user or project_role' });
     }
+
+    await ensureOrganizationMember({
+      organizationId: req.organizationId,
+      userId: user_id,
+      orgMemberRole: 'team_member',
+    });
 
     const { data, error } = await supabaseAdmin
       .from('project_members')
@@ -490,7 +585,7 @@ router.post('/projects/:id/members', requireOrgContext, attachOrgFromProject, re
 router.delete('/projects/:id/members/:userId', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
-    if (!canManageProjectMembers(userRole)) {
+    if (!(await resolveCanManageProjectMembers(req.user.id, req.params.id, userRole))) {
       return res.status(403).json({ error: 'You do not have permission to manage project members' });
     }
 
@@ -764,22 +859,26 @@ router.get('/issues', requireOrgContext, async (req, res) => {
         .eq('user_id', req.user.id)
         .in('project_id', projectIds);
       const clientProjectIds = new Set(
-        (memberships || []).filter((m) => m.project_role === 'client').map((m) => m.project_id)
+        (memberships || []).filter((m) => isClientProjectMemberRole(m.project_role)).map((m) => m.project_id)
       );
       if (clientProjectIds.size > 0) {
+        const viewerId = uuidKeyPart(req.user.id);
         issues = issues.filter((i) => {
           if (i.status !== 'to_do' || !clientProjectIds.has(i.project_id)) return true;
-          const creator = i.created_by || i.reporter_id;
-          return creator === req.user.id;
+          const creator = issueCreatorUserId(i);
+          return uuidKeyPart(creator) === viewerId;
         });
       }
     }
     
     // Get user emails from profiles
     const userIds = new Set();
-    issues.forEach(issue => {
+    issues.forEach((issue) => {
       if (issue.assignee_id) userIds.add(issue.assignee_id);
       if (issue.reporter_id) userIds.add(issue.reporter_id);
+      if (issue.created_by) userIds.add(issue.created_by);
+      const cr = issueCreatorUserId(issue);
+      if (cr) userIds.add(cr);
     });
     
     const userIdsArray = Array.from(userIds);
@@ -797,34 +896,38 @@ router.get('/issues', requireOrgContext, async (req, res) => {
       }
     }
 
-    // Who created the issue: prefer explicit created_by if column exists, else reporter_id
-    const creatorIds = [
-      ...new Set(
-        (issues || [])
-          .map((i) => i.created_by || i.reporter_id)
-          .filter(Boolean)
-      ),
+    // Client-created highlight: any issue whose reporter is a project member with role `client`
+    // on that project. One query per distinct project (no fragile double-.in() on user ids).
+    const uniqueProjectIdsForClients = [
+      ...new Set((issues || []).map((i) => issueProjectIdForCreator(i)).filter(Boolean)),
     ];
-    const creatorRoleByUserId = {};
-    if (creatorIds.length > 0) {
-      const { data: roleRows } = await supabaseAdmin
-        .from('user_roles')
-        .select('user_id, role')
-        .in('user_id', creatorIds);
-      (roleRows || []).forEach((row) => {
-        creatorRoleByUserId[row.user_id] = row.role;
+    const clientReporterKeys = new Set();
+    if (uniqueProjectIdsForClients.length > 0) {
+      const { data: pmRows, error: pmLookupErr } = await supabaseAdmin
+        .from('project_members')
+        .select('project_id, user_id, project_role')
+        .in('project_id', uniqueProjectIdsForClients);
+      if (pmLookupErr) {
+        console.error('[GET /issues] project_members lookup for created_by_client failed', pmLookupErr);
+      }
+      (pmRows || []).forEach((row) => {
+        if (!isClientProjectMemberRole(row.project_role)) return;
+        const k = issueCreatorClientMapKey(row.project_id, row.user_id);
+        if (k) clientReporterKeys.add(k);
       });
     }
-    
+
     // Attach user info to issues
-    const issuesWithUsers = issues.map(issue => {
-      const creatorId = issue.created_by || issue.reporter_id;
-      const creatorRole = creatorId ? creatorRoleByUserId[creatorId] : null;
+    const issuesWithUsers = issues.map((issue) => {
+      const creatorId = issueCreatorUserId(issue);
+      const pid = issueProjectIdForCreator(issue);
+      const key = creatorId && pid ? issueCreatorClientMapKey(pid, creatorId) : '';
+      const created_by_client = Boolean(key && clientReporterKeys.has(key));
       return {
         ...issue,
         assignee: issue.assignee_id ? profiles[issue.assignee_id] || { id: issue.assignee_id, email: 'Unknown' } : null,
         reporter: issue.reporter_id ? profiles[issue.reporter_id] || { id: issue.reporter_id, email: 'Unknown' } : null,
-        created_by_client: creatorRole === 'client',
+        created_by_client,
       };
     });
     
@@ -869,8 +972,8 @@ router.get('/issues/:id', requireOrgContext, async (req, res) => {
         .eq('project_id', issue.project_id)
         .eq('user_id', req.user.id)
         .maybeSingle();
-      if (pm?.project_role === 'client') {
-        const creator = issue.created_by || issue.reporter_id;
+      if (isClientProjectMemberRole(pm?.project_role)) {
+        const creator = issueCreatorUserId(issue);
         if (issue.status === 'to_do' && creator !== req.user.id) {
           return res.status(404).json({ error: 'Issue not found' });
         }
@@ -915,15 +1018,17 @@ router.get('/issues/:id', requireOrgContext, async (req, res) => {
       }
     }
 
-    const creatorId = issue.created_by || issue.reporter_id;
+    const creatorId = issueCreatorUserId(issue);
+    const pid = issueProjectIdForCreator(issue);
     let created_by_client = false;
-    if (creatorId) {
-      const { data: creatorRoleRow } = await supabaseAdmin
-        .from('user_roles')
-        .select('role')
+    if (creatorId && pid) {
+      const { data: creatorPm } = await supabaseAdmin
+        .from('project_members')
+        .select('project_role')
+        .eq('project_id', pid)
         .eq('user_id', creatorId)
         .maybeSingle();
-      created_by_client = creatorRoleRow?.role === 'client';
+      created_by_client = isClientProjectMemberRole(creatorPm?.project_role);
     }
     
     // Attach user info, parent, and subtasks
@@ -1069,13 +1174,14 @@ router.post('/issues', requireOrgContext, async (req, res) => {
       finalInternalPriority = priorityMap[finalInternalPriority];
     }
 
-    let finalWorkflowStatus = DEFAULT_WORKFLOW_STATUS;
+    const boardStatus = status || 'to_do';
+    let finalWorkflowStatus = defaultWorkflowForBoardStatus(boardStatus);
     if (workflow_status !== undefined && workflow_status !== null && workflow_status !== '') {
-      const wv = validateWorkflowStatus(workflow_status);
+      const wv = validateWorkflowStatus(workflow_status, boardStatus);
       if (!wv.ok) return res.status(400).json({ error: wv.error });
       finalWorkflowStatus = wv.value;
     }
-    
+
     const { data: issue, error } = await supabaseAdmin
       .from('issues')
       .insert([{
@@ -1084,7 +1190,7 @@ router.post('/issues', requireOrgContext, async (req, res) => {
         issue_type_id,
         summary,
         description,
-        status: status || 'to_do',
+        status: boardStatus,
         internal_priority: finalInternalPriority,
         client_priority: client_priority || null,
         assignee_id,
@@ -1126,6 +1232,14 @@ router.post('/issues', requireOrgContext, async (req, res) => {
     if (projectData) project = projectData;
     if (issueTypeData) issue_type = issueTypeData;
     const issueWithJoins = { ...issue, project, issue_type };
+
+    const { data: creatorPmRow } = await supabaseAdmin
+      .from('project_members')
+      .select('project_role')
+      .eq('project_id', issue.project_id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    const created_by_client = isClientProjectMemberRole(creatorPmRow?.project_role);
     
     // Get user emails from profiles
     const userIds = [];
@@ -1156,7 +1270,8 @@ router.post('/issues', requireOrgContext, async (req, res) => {
     const issueWithUsers = {
       ...issueWithJoins,
       assignee: issueWithJoins.assignee_id ? profiles[issueWithJoins.assignee_id] || { id: issueWithJoins.assignee_id, email: 'Unknown' } : null,
-      reporter: reporterProfile || { id: req.user.id, email: req.user.email || 'Unknown' }
+      reporter: reporterProfile || { id: req.user.id, email: req.user.email || 'Unknown' },
+      created_by_client,
     };
 
     // Create notification for assignee if different from reporter
@@ -1205,7 +1320,23 @@ router.put('/issues/:id', requireOrgContext, async (req, res) => {
     if (!canAccessIssueProject) {
       return res.status(404).json({ error: 'Issue not found' });
     }
-    
+
+    const nextBoardStatus =
+      req.body.status !== undefined ? req.body.status : currentIssue.status;
+    if (req.body.workflow_status !== undefined) {
+      const wv = validateWorkflowStatus(req.body.workflow_status, nextBoardStatus);
+      if (!wv.ok) return res.status(400).json({ error: wv.error });
+      req.body.workflow_status = wv.value;
+    } else if (
+      req.body.status !== undefined &&
+      req.body.status !== currentIssue.status
+    ) {
+      req.body.workflow_status = coerceWorkflowForBoardStatus(
+        currentIssue.workflow_status,
+        nextBoardStatus
+      );
+    }
+
     // Permission checks
     // Clients can only update client_priority and description
     if (userRole === 'client') {
@@ -1269,12 +1400,7 @@ router.put('/issues/:id', requireOrgContext, async (req, res) => {
           updateData[field] = req.body[field];
         }
       });
-      if (updateData.workflow_status !== undefined) {
-        const wv = validateWorkflowStatus(updateData.workflow_status);
-        if (!wv.ok) return res.status(400).json({ error: wv.error });
-        updateData.workflow_status = wv.value;
-      }
-      
+
       // Can only update if assigned to them or created by them
       if (currentIssue.assignee_id !== req.user.id && currentIssue.reporter_id !== req.user.id) {
         return res.status(403).json({ error: 'You can only update issues assigned to you' });
@@ -1338,11 +1464,13 @@ router.put('/issues/:id', requireOrgContext, async (req, res) => {
     const priorityToLegacy = { P1: 'highest', P2: 'high', P3: 'medium', P4: 'low', P5: 'lowest' };
     const buildSafeUpdateBody = () => {
       const safe = {};
+      const safeNextStatus =
+        req.body.status !== undefined ? req.body.status : currentIssue.status;
       if (req.body.summary !== undefined) safe.summary = req.body.summary;
       if (req.body.description !== undefined) safe.description = req.body.description;
       if (req.body.status !== undefined) safe.status = req.body.status;
       if (req.body.workflow_status !== undefined) {
-        const wv = validateWorkflowStatus(req.body.workflow_status);
+        const wv = validateWorkflowStatus(req.body.workflow_status, safeNextStatus);
         if (wv.ok) safe.workflow_status = wv.value;
       }
       if (req.body.story_points !== undefined) safe.story_points = req.body.story_points;
@@ -1368,10 +1496,7 @@ router.put('/issues/:id', requireOrgContext, async (req, res) => {
     if (req.body.summary !== undefined) updatesForLog.summary = req.body.summary;
     if (req.body.description !== undefined) updatesForLog.description = req.body.description;
     if (req.body.workflow_status !== undefined) {
-      const wv = validateWorkflowStatus(req.body.workflow_status);
-      if (!wv.ok) return res.status(400).json({ error: wv.error });
-      req.body.workflow_status = wv.value;
-      updatesForLog.workflow_status = wv.value;
+      updatesForLog.workflow_status = req.body.workflow_status;
     }
     await logIssueChanges(supabaseAdmin, req.params.id, currentIssue, updatesForLog, req.user.id);
 
@@ -1462,9 +1587,6 @@ router.put('/issues/:id', requireOrgContext, async (req, res) => {
 router.delete('/issues/:id', requireOrgContext, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
-    if (!canManageProjectMembers(userRole)) {
-      return res.status(403).json({ error: 'You do not have permission to delete issues' });
-    }
     const { data: existing, error: fetchErr } = await supabaseAdmin
       .from('issues')
       .select('id, issue_key, summary, project_id')
@@ -1482,6 +1604,9 @@ router.delete('/issues/:id', requireOrgContext, async (req, res) => {
     );
     if (!okProject) {
       return res.status(404).json({ error: 'Issue not found' });
+    }
+    if (!(await resolveCanManageProjectMembers(req.user.id, existing.project_id, userRole))) {
+      return res.status(403).json({ error: 'You do not have permission to delete issues' });
     }
     await logActivity(supabaseAdmin, {
       entity_type: 'TASK',
@@ -1653,7 +1778,7 @@ router.get('/clients', requireOrgContext, async (req, res) => {
 router.post('/clients', requireOrgContext, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
-    if (!canManageProjectMembers(userRole)) {
+    if (!(await canManageClientsResource(req.user.id, req.organizationId, userRole))) {
       return res.status(403).json({ error: 'You do not have permission to manage clients' });
     }
     const { name, email, company, phone, address, notes } = req.body;
@@ -1779,7 +1904,7 @@ router.get('/clients/:id', requireOrgContext, async (req, res) => {
 router.put('/clients/:id', requireOrgContext, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
-    if (!canManageProjectMembers(userRole)) {
+    if (!(await canManageClientsResource(req.user.id, req.organizationId, userRole))) {
       return res.status(403).json({ error: 'You do not have permission to manage clients' });
     }
     const { data, error } = await supabaseAdmin

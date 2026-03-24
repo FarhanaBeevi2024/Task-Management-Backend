@@ -1,70 +1,169 @@
 import { supabaseAdmin } from '../supabaseAdmin.js';
+import { userRoleFromInvitationOrgRole } from '../roleWorkspace.js';
 
 /**
- * Single-tenant-per-user org resolution.
- * - Normal users: organization_id is derived from organization_members(user_id).
- * - SuperAdmin: bypasses org restriction (can access all orgs); organizationId may be left null.
+ * Multi-organization support:
+ * - Load all organization_members for the user.
+ * - If req.orgIdFromRoute is set (org admin routes), verify membership in that org.
+ * - Else use X-Organization-Id header when user belongs to multiple orgs.
+ * - Else single membership auto-selects.
+ * - SuperAdmin: bypass (no req.organizationId unless set elsewhere).
  */
 export async function requireOrgContext(req, res, next) {
   if (req.isSuperAdmin) return next();
 
-  const { data: membership, error } = await supabaseAdmin
+  const { data: memberships, error } = await supabaseAdmin
     .from('organization_members')
-    .select('organization_id, role, organizations:organization_id(id, status)')
-    .eq('user_id', req.user.id)
-    .maybeSingle();
+    .select('organization_id, role, organizations:organization_id(id, name, status)')
+    .eq('user_id', req.user.id);
 
   if (error) return res.status(500).json({ error: error.message });
-  if (!membership) {
-    // Auto-accept invitation on first login/signup.
+
+  const activeMemberships = (memberships || []).filter(
+    (m) => m.organizations && m.organizations.status === 'active'
+  );
+
+  const tryAcceptInvitation = async () => {
     const email = (req.user.email || '').trim().toLowerCase();
-    if (!email) return res.status(403).json({ error: 'No organization assigned to this user' });
+    if (!email) return null;
 
-    const { data: invite, error: inviteError } = await supabaseAdmin
-      .from('organization_invitations')
-      .select('id, organization_id, role, status, expires_at, organizations:organization_id(id, status)')
-      .eq('email', email)
-      .eq('status', 'pending')
-      .order('created_at', { ascending: false })
-      .maybeSingle();
+    const findInvitation = async (statuses) => {
+      const q = supabaseAdmin
+        .from('organization_invitations')
+        .select('id, organization_id, role, status, expires_at, organizations:organization_id(id, status)')
+        .eq('email', email);
 
-    if (!inviteError && invite && (invite.expires_at == null || new Date(invite.expires_at) > new Date())) {
-      if (invite.organizations?.status !== 'active') {
-        return res.status(403).json({ error: 'Organization is inactive' });
+      if (Array.isArray(statuses) && statuses.length > 0) {
+        q.in('status', statuses);
       }
 
-      const { data: created, error: createError } = await supabaseAdmin
-        .from('organization_members')
-        .insert([{
-          organization_id: invite.organization_id,
-          user_id: req.user.id,
-          role: invite.role,
-        }])
-        .select('organization_id, role, organizations:organization_id(id, status)')
-        .single();
+      return q
+        .order('created_at', { ascending: false })
+        .maybeSingle();
+    };
 
-      if (!createError && created) {
-        await supabaseAdmin
-          .from('organization_invitations')
-          .update({ status: 'accepted', accepted_at: new Date().toISOString() })
-          .eq('id', invite.id);
+    // First try pending invites; if none exists, recover from inconsistent states
+    // where an invite is already accepted but organization_members row is missing.
+    const { data: invite, error: inviteError } = await findInvitation(['pending']);
 
-        req.organizationId = created.organization_id;
-        req.orgRole = created.role;
-        return next();
-      }
+    if (inviteError) {
+      console.error('Auto-link: error fetching pending invite', {
+        user_id: req.user.id,
+        email,
+        error: inviteError?.message || inviteError,
+      });
     }
 
-    return res.status(403).json({ error: 'No organization assigned to this user' });
+    let chosen = invite;
+
+    if (!chosen) {
+      const { data: acceptedInvite, error: acceptedErr } = await findInvitation(['accepted']);
+      if (acceptedErr) {
+        console.error('Auto-link: error fetching accepted invite', {
+          user_id: req.user.id,
+          email,
+          error: acceptedErr?.message || acceptedErr,
+        });
+      }
+      chosen = acceptedInvite;
+    }
+    if (inviteError || !chosen) return null;
+    if (chosen.expires_at != null && new Date(chosen.expires_at) <= new Date()) return null;
+    if (chosen.organizations?.status !== 'active') return null;
+
+    const { data: created, error: createError } = await supabaseAdmin
+      .from('organization_members')
+      .insert([{
+        organization_id: chosen.organization_id,
+        user_id: req.user.id,
+        role: chosen.role,
+      }])
+      .select('organization_id, role, organizations:organization_id(id, name, status)')
+      .single();
+
+    if (createError || !created) {
+      console.error('Auto-link: failed to insert organization_members', {
+        user_id: req.user.id,
+        email,
+        invite_id: chosen.id,
+        organization_id: chosen.organization_id,
+        role: chosen.role,
+        error: createError?.message || createError,
+      });
+      return null;
+    }
+
+    // Workspace user_roles: admin | user only
+    await supabaseAdmin
+      .from('user_roles')
+      .upsert(
+        { user_id: req.user.id, role: userRoleFromInvitationOrgRole(chosen.role), is_active: true },
+        { onConflict: 'user_id' }
+      );
+
+    if (chosen.status === 'pending') {
+      await supabaseAdmin
+        .from('organization_invitations')
+        .update({ status: 'accepted', accepted_at: new Date().toISOString() })
+        .eq('id', chosen.id);
+    }
+
+    return created;
+  };
+
+  let working = [...activeMemberships];
+
+  if (working.length === 0) {
+    const fromInvite = await tryAcceptInvitation();
+    if (fromInvite) {
+      working = [fromInvite];
+    } else {
+      return res.status(403).json({ error: 'No organization assigned to this user' });
+    }
   }
 
-  const org = membership.organizations;
-  if (!org) return res.status(403).json({ error: 'Organization not found for this user' });
-  if (org.status !== 'active') return res.status(403).json({ error: 'Organization is inactive' });
+  const pickFromRoute = req.orgIdFromRoute != null && String(req.orgIdFromRoute).length > 0;
+  if (pickFromRoute) {
+    const m = working.find(
+      (x) => String(x.organization_id) === String(req.orgIdFromRoute)
+    );
+    if (!m) {
+      return res.status(403).json({ error: 'You are not a member of this organization' });
+    }
+    req.organizationId = m.organization_id;
+    req.orgRole = m.role;
+    req.orgMemberships = working;
+    return next();
+  }
 
-  req.organizationId = membership.organization_id;
-  req.orgRole = membership.role;
-  next();
+  const headerOrg = req.headers['x-organization-id'] || req.headers['X-Organization-Id'];
+  if (headerOrg) {
+    const m = working.find((x) => String(x.organization_id) === String(headerOrg));
+    if (!m) {
+      return res.status(403).json({ error: 'You are not a member of this organization' });
+    }
+    req.organizationId = m.organization_id;
+    req.orgRole = m.role;
+    req.orgMemberships = working;
+    return next();
+  }
+
+  if (working.length === 1) {
+    req.organizationId = working[0].organization_id;
+    req.orgRole = working[0].role;
+    req.orgMemberships = working;
+    return next();
+  }
+
+  return res.status(400).json({
+    error: 'Select an organization',
+    code: 'ORG_REQUIRED',
+    organizations: working.map((m) => ({
+      id: m.organization_id,
+      name: m.organizations?.name || 'Organization',
+      org_role: m.role,
+    })),
+  });
 }
 
 export async function attachOrgFromProject(req, res, next) {
@@ -106,4 +205,3 @@ export function requireSameOrganizationForResource(req, res, next) {
   }
   next();
 }
-
