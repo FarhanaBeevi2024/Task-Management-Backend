@@ -650,6 +650,22 @@ app.get('/api/users', authenticate, loadGlobalRole, requireOrgContext, async (re
       String(req.query?.include_pending_signups || '') === '1' ||
       String(req.query?.include_pending_signups || '').toLowerCase() === 'true';
     if (wantPendingSignups && (await canManageOrgDirectory(req))) {
+      // Limit pending-signup rows to users invited for this organization.
+      // Without this, any orphan profile in the whole system can appear here.
+      const { data: invites, error: invitesErr } = await supabaseAdmin
+        .from('organization_invitations')
+        .select('email, status')
+        .eq('organization_id', req.organizationId);
+      if (invitesErr) throw invitesErr;
+      const invitedEmails = new Set(
+        (invites || [])
+          .filter((i) => {
+            const s = String(i?.status || '').toLowerCase();
+            return s === 'pending' || s === 'accepted';
+          })
+          .map((i) => String(i?.email || '').trim().toLowerCase())
+          .filter(Boolean)
+      );
       const { data: anyMemberships, error: anyMemErr } = await supabaseAdmin
         .from('organization_members')
         .select('user_id');
@@ -660,9 +676,35 @@ app.get('/api/users', authenticate, loadGlobalRole, requireOrgContext, async (re
         .select('id, email');
       if (allProfilesError) throw allProfilesError;
       const orphanIds = (allProfiles || [])
-        .filter((p) => p.id && !inAnyOrganization.has(p.id))
+        .filter((p) => {
+          if (!p?.id || inAnyOrganization.has(p.id)) return false;
+          const email = String(p.email || '').trim().toLowerCase();
+          return invitedEmails.has(email);
+        })
         .map((p) => p.id);
       userIds = [...new Set([...memberIds, ...orphanIds])];
+    }
+
+    const projectId = String(req.query?.project_id || '').trim();
+    if (projectId) {
+      const { data: allAssocRows, error: allowedErr } = await supabaseAdmin
+        .from('organization_user_project_access')
+        .select('user_id')
+        .eq('organization_id', req.organizationId);
+      if (allowedErr) throw allowedErr;
+      const usersWithExplicitAssociation = new Set((allAssocRows || []).map((r) => r.user_id));
+
+      const { data: projectRows, error: projectRowsErr } = await supabaseAdmin
+        .from('organization_user_project_access')
+        .select('user_id')
+        .eq('organization_id', req.organizationId)
+        .eq('project_id', projectId);
+      if (projectRowsErr) throw projectRowsErr;
+      const allowedUserIdsForProject = new Set((projectRows || []).map((r) => r.user_id));
+
+      // Default behavior: if a user has no explicit project rows, they are allowed on all projects.
+      // If they have explicit rows, they are allowed only on listed projects.
+      userIds = userIds.filter((id) => !usersWithExplicitAssociation.has(id) || allowedUserIdsForProject.has(id));
     }
 
     if (userIds.length === 0) {
@@ -670,13 +712,13 @@ app.get('/api/users', authenticate, loadGlobalRole, requireOrgContext, async (re
     }
 
     const [{ data: profiles, error: profilesError }, { data: userRoles, error: rolesError }] = await Promise.all([
-      supabaseAdmin.from('profiles').select('id, email').in('id', userIds),
+      supabaseAdmin.from('profiles').select('id, email, first_name, last_name').in('id', userIds),
       supabaseAdmin.from('user_roles').select('user_id, role, is_active').in('user_id', userIds),
     ]);
     if (profilesError) throw profilesError;
     if (rolesError) throw rolesError;
 
-    const emailById = new Map((profiles || []).map((p) => [p.id, p.email]));
+    const profileById = new Map((profiles || []).map((p) => [p.id, p]));
     const globalById = new Map((userRoles || []).map((r) => [r.user_id, r]));
 
     const rows = userIds.map((id) => {
@@ -687,18 +729,87 @@ app.get('/api/users', authenticate, loadGlobalRole, requireOrgContext, async (re
         : workspaceRoleFromOrgMember(null, gr);
       return {
         user_id: id,
-        email: emailById.get(id) || 'Unknown',
+        email: profileById.get(id)?.email || 'Unknown',
+        first_name: profileById.get(id)?.first_name || '',
+        last_name: profileById.get(id)?.last_name || '',
         role: workspaceRole,
         active: globalById.get(id)?.is_active !== false,
         pending_org_membership: !orgRoleById.has(id),
       };
     }).filter((row) => {
-      // Non-superadmins shouldn't see other superadmin accounts in Users UI.
+      // Non-superadmins shouldn't see superadmin accounts in Users UI.
       if (req.isSuperAdmin) return true;
-      return row.role !== 'superadmin';
+      const globalRole = globalById.get(row.user_id)?.role || 'user';
+      return globalRole !== 'superadmin';
     });
     rows.sort((a, b) => String(a.email || '').localeCompare(String(b.email || ''), undefined, { sensitivity: 'base' }));
     res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/user-project-associations', authenticate, loadGlobalRole, requireOrgContext, async (req, res) => {
+  try {
+    if (!(await canManageOrgDirectory(req))) {
+      return res.status(403).json({ error: 'You do not have permission to view user project associations' });
+    }
+    const { data, error } = await supabaseAdmin
+      .from('organization_user_project_access')
+      .select('user_id, project_id')
+      .eq('organization_id', req.organizationId);
+    if (error) throw error;
+    res.json({ associations: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/users/:userId/project-associations', authenticate, loadGlobalRole, requireOrgContext, async (req, res) => {
+  try {
+    if (!(await canManageOrgDirectory(req))) {
+      return res.status(403).json({ error: 'You do not have permission to manage user project associations' });
+    }
+
+    const userId = req.params.userId;
+    const inputIds = Array.isArray(req.body?.project_ids) ? req.body.project_ids : null;
+    if (inputIds == null) {
+      return res.status(400).json({ error: 'project_ids must be an array' });
+    }
+    const nextProjectIds = [...new Set(inputIds.map((v) => String(v || '').trim()).filter(Boolean))];
+
+    // Only allow projects from caller's organization.
+    let validProjectIds = [];
+    if (nextProjectIds.length > 0) {
+      const { data: validProjects, error: validErr } = await supabaseAdmin
+        .from('projects')
+        .select('id')
+        .eq('organization_id', req.organizationId)
+        .in('id', nextProjectIds);
+      if (validErr) throw validErr;
+      validProjectIds = (validProjects || []).map((p) => p.id);
+    }
+
+    const { error: delErr } = await supabaseAdmin
+      .from('organization_user_project_access')
+      .delete()
+      .eq('organization_id', req.organizationId)
+      .eq('user_id', userId);
+    if (delErr) throw delErr;
+
+    if (validProjectIds.length > 0) {
+      const rows = validProjectIds.map((projectId) => ({
+        organization_id: req.organizationId,
+        user_id: userId,
+        project_id: projectId,
+      }));
+      const { error: insErr } = await supabaseAdmin
+        .from('organization_user_project_access')
+        .insert(rows);
+      if (insErr) throw insErr;
+    }
+
+    res.json({ ok: true, user_id: userId, project_ids: validProjectIds });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -777,6 +888,173 @@ app.put('/api/admin/role-access', authenticate, loadGlobalRole, async (req, res)
   }
 });
 
+app.post('/api/admin/users/create', authenticate, loadGlobalRole, requireOrgContext, async (req, res) => {
+  try {
+    if (!(await canManageOrgDirectory(req))) {
+      return res.status(403).json({ error: 'You do not have permission to create users' });
+    }
+
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    const firstName = String(req.body?.first_name || '').trim();
+    const lastName = String(req.body?.last_name || '').trim();
+    const workspaceRole = String(req.body?.role || 'user').trim().toLowerCase();
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'Valid email is required' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+    if (workspaceRole !== 'admin' && workspaceRole !== 'user') {
+      return res.status(400).json({ error: 'Role must be admin or user' });
+    }
+
+    const created = await supabaseAdmin.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: {
+        ...(firstName ? { first_name: firstName } : {}),
+        ...(lastName ? { last_name: lastName } : {}),
+      },
+    });
+    if (created.error) throw created.error;
+    const userId = created.data?.user?.id;
+    if (!userId) {
+      return res.status(500).json({ error: 'Failed to create user account' });
+    }
+
+    const orgRole = inviteWorkspaceRoleToOrgRole(workspaceRole);
+    await ensureOrganizationMember({
+      organizationId: req.organizationId,
+      userId,
+      orgMemberRole: orgRole,
+    });
+
+    const { error: roleErr } = await supabaseAdmin
+      .from('user_roles')
+      .upsert(
+        { user_id: userId, role: workspaceRole, is_active: true },
+        { onConflict: 'user_id' }
+      );
+    if (roleErr) throw roleErr;
+
+    const { error: profileErr } = await supabaseAdmin
+      .from('profiles')
+      .upsert(
+        { id: userId, email, first_name: firstName || null, last_name: lastName || null },
+        { onConflict: 'id' }
+      );
+    if (profileErr) throw profileErr;
+
+    res.status(201).json({ user_id: userId, email, role: workspaceRole, active: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/users/:userId', authenticate, loadGlobalRole, requireOrgContext, async (req, res) => {
+  try {
+    if (!(await canManageOrgDirectory(req))) {
+      return res.status(403).json({ error: 'You do not have permission to update users' });
+    }
+
+    const userId = req.params.userId;
+    const emailRaw = req.body?.email;
+    const passwordRaw = req.body?.password;
+    const firstNameRaw = req.body?.first_name;
+    const lastNameRaw = req.body?.last_name;
+    const roleRaw = req.body?.role;
+    const activeRaw = req.body?.active;
+
+    const updates = {};
+    const email = emailRaw == null ? null : String(emailRaw).trim().toLowerCase();
+    const password = passwordRaw == null ? null : String(passwordRaw);
+    const firstName = firstNameRaw == null ? null : String(firstNameRaw).trim();
+    const lastName = lastNameRaw == null ? null : String(lastNameRaw).trim();
+    const nextRole = roleRaw == null ? null : String(roleRaw).trim().toLowerCase();
+    const nextActive = activeRaw == null ? null : Boolean(activeRaw);
+
+    if (emailRaw !== undefined) {
+      if (!email || !email.includes('@')) {
+        return res.status(400).json({ error: 'Valid email is required' });
+      }
+      updates.email = email;
+    }
+    if (passwordRaw !== undefined) {
+      if (!password || password.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      }
+      updates.password = password;
+    }
+    if (firstNameRaw !== undefined) updates.first_name = firstName;
+    if (lastNameRaw !== undefined) updates.last_name = lastName;
+
+    if (roleRaw !== undefined) {
+      if (nextRole !== 'admin' && nextRole !== 'user') {
+        return res.status(400).json({ error: 'Role must be admin or user' });
+      }
+      if (String(req.user.id) === String(userId) && nextRole === 'user') {
+        return res.status(403).json({ error: 'You cannot change your own role to user' });
+      }
+      updates.role = nextRole;
+    }
+    if (activeRaw !== undefined) {
+      updates.active = nextActive;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    if (updates.email || updates.password || updates.first_name !== undefined || updates.last_name !== undefined) {
+      const authPayload = {};
+      if (updates.email) authPayload.email = updates.email;
+      if (updates.password) authPayload.password = updates.password;
+      if (updates.email) authPayload.email_confirm = true;
+      if (updates.first_name !== undefined || updates.last_name !== undefined) {
+        authPayload.user_metadata = {
+          ...(updates.first_name !== undefined ? { first_name: updates.first_name || '' } : {}),
+          ...(updates.last_name !== undefined ? { last_name: updates.last_name || '' } : {}),
+        };
+      }
+      const authRes = await supabaseAdmin.auth.admin.updateUserById(userId, authPayload);
+      if (authRes.error) throw authRes.error;
+
+      const profilePayload = { id: userId };
+      if (updates.email) profilePayload.email = updates.email;
+      if (updates.first_name !== undefined) profilePayload.first_name = updates.first_name || null;
+      if (updates.last_name !== undefined) profilePayload.last_name = updates.last_name || null;
+      const { error: profileErr } = await supabaseAdmin
+        .from('profiles')
+        .upsert(profilePayload, { onConflict: 'id' });
+      if (profileErr) throw profileErr;
+    }
+
+    if (updates.role || updates.active !== undefined) {
+      const row = {};
+      if (updates.role) row.role = updates.role;
+      if (updates.active !== undefined) row.is_active = updates.active;
+      const { error: roleErr } = await supabaseAdmin
+        .from('user_roles')
+        .upsert({ user_id: userId, ...row }, { onConflict: 'user_id' });
+      if (roleErr) throw roleErr;
+      if (updates.role) {
+        const orgMemberRole = workspaceRoleToOrgMemberRole(updates.role);
+        await supabaseAdmin
+          .from('organization_members')
+          .update({ role: orgMemberRole })
+          .eq('organization_id', req.organizationId)
+          .eq('user_id', userId);
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ====== ADMIN: Manage user roles (gated by accessConfig) ======
 app.put('/api/admin/users/:userId/role', authenticate, loadGlobalRole, requireOrgContext, async (req, res) => {
   try {
@@ -787,6 +1065,9 @@ app.put('/api/admin/users/:userId/role', authenticate, loadGlobalRole, requireOr
     const { role } = req.body;
     if (role !== 'admin' && role !== 'user') {
       return res.status(400).json({ error: 'Role must be admin or user' });
+    }
+    if (String(req.user.id) === String(req.params.userId) && role === 'user') {
+      return res.status(403).json({ error: 'You cannot change your own role to user' });
     }
 
     const targetGlobal = await getUserRole(req.params.userId);
