@@ -1080,12 +1080,13 @@ router.get('/issues/:id/activity-logs', requireOrgContext, async (req, res) => {
       }
     }
 
+    // Back-compat: older rows may have organization_id = null.
     let query = supabaseAdmin
       .from('activity_logs')
       .select('*')
       .eq('entity_type', 'TASK')
       .eq('entity_id', issueId)
-      .eq('organization_id', req.organizationId)
+      .or(`organization_id.eq.${req.organizationId},organization_id.is.null`)
       .order('performed_at', { ascending: false });
 
     const { data: logs, error: logsError } = await query;

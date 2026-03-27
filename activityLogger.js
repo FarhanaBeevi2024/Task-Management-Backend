@@ -74,6 +74,7 @@ export async function logIssueChanges(supabase, issueId, oldIssue, updates, perf
       old_value,
       new_value,
       performed_by: performedBy,
+      organization_id: oldIssue?.organization_id || null,
     });
   }
 }
