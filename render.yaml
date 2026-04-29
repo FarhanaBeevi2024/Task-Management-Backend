@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: task-management-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+    # Add your other environment variables below (use Render dashboard for secrets)
+    # Refer to Render environment variables guide
