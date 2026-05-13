@@ -5,7 +5,12 @@ import { authenticate } from './middleware/auth.js';
 import { inviteSignupUrl, escapeIlikeExact, normalizeInviteEmail } from './inviteHelpers.js';
 import { invitationMatchesUser } from './orgMembershipHelpers.js';
 import { userRoleFromInvitationOrgRole } from './roleWorkspace.js';
-import { logger, isDebugEnabled } from './logger.js';
+import { logger } from './logger.js';
+
+/** When true, recovery uses admin generateLink only (no email)—see server logs for the URL. */
+function passwordResetNoEmail() {
+  return String(process.env.PASSWORD_RESET_NO_EMAIL || '').toLowerCase() === 'true';
+}
 
 const router = express.Router();
 
@@ -34,30 +39,32 @@ router.post('/auth/recovery-action', async (req, res) => {
     }
 
     const frontendBase = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
+    const redirectTo = `${frontendBase}/reset-password`;
 
-    // LOG_LEVEL=debug: do NOT call resetPasswordForEmail — that hits Supabase email rate limits.
-    // Only admin generateLink (no email); recovery URL is logged for local/testing use.
-    if (isDebugEnabled()) {
+    // Optional dev/staging: skip emailing (avoids rate limits). Link is logged at debug level only.
+    if (passwordResetNoEmail()) {
       const { data, error } = await supabaseAdmin.auth.admin.generateLink({
         type: 'recovery',
         email,
         options: {
-          redirectTo: frontendBase,
+          redirectTo,
         },
       });
       if (error) throw error;
       const actionLink = data?.properties?.action_link || '';
       if (actionLink) {
-        logger.debug('[auth/recovery-action] recovery action_link (debug only, no email sent)', {
+        // Use warn so the link is visible at default LOG_LEVEL=info (debug level hides logger.debug).
+        logger.warn('[auth/recovery-action] PASSWORD_RESET_NO_EMAIL: open this recovery URL (not emailed)', {
           email,
           actionLink,
         });
       } else {
-        logger.warn('[auth/recovery-action] debug: generateLink returned no action_link', { email });
+        logger.warn('[auth/recovery-action] generateLink returned no action_link', { email });
       }
       return res.json({
         message:
-          'Debug mode (LOG_LEVEL=debug): no reset email was sent. The recovery link is in the server logs only.',
+          'Password reset link was generated for development only (not emailed). Check server logs.',
+        delivery: 'log_only',
       });
     }
 
@@ -65,12 +72,12 @@ router.post('/auth/recovery-action', async (req, res) => {
     if (!supabaseAnon) {
       return res.status(503).json({
         error:
-          'Password reset is not configured: set SUPABASE_ANON_KEY on the server, or set LOG_LEVEL=debug temporarily for link-in-logs only (no email).',
+          'Password reset is not configured: set SUPABASE_ANON_KEY on the server. For local testing without email, set PASSWORD_RESET_NO_EMAIL=true.',
       });
     }
 
     const { error: recoverErr } = await supabaseAnon.auth.resetPasswordForEmail(email, {
-      redirectTo: frontendBase,
+      redirectTo,
     });
     if (recoverErr) throw recoverErr;
     logger.info('[auth/recovery-action] password reset email requested', { email });
@@ -78,6 +85,7 @@ router.post('/auth/recovery-action', async (req, res) => {
     return res.json({
       message:
         'If an account exists for this email, you will receive password reset instructions shortly.',
+      delivery: 'email',
     });
   } catch (e) {
     return res.status(500).json({ error: e?.message || String(e) });
