@@ -500,7 +500,7 @@ router.get('/projects/:id/members', requireOrgContext, attachOrgFromProject, req
       await Promise.all([
         supabaseAdmin
           .from('profiles')
-          .select('id, email')
+          .select('id, email, first_name, last_name')
           .in('id', userIds),
         supabaseAdmin
           .from('user_roles')
@@ -517,18 +517,33 @@ router.get('/projects/:id/members', requireOrgContext, attachOrgFromProject, req
     if (rolesError) throw rolesError;
     if (orgMemErr) throw orgMemErr;
 
-    const emailById = new Map((profiles || []).map((p) => [p.id, p.email]));
+    const profileById = new Map((profiles || []).map((p) => [p.id, p]));
     const globalRoleById = new Map((roles || []).map((r) => [r.user_id, r.role]));
     const orgRoleById = new Map((orgMembers || []).map((r) => [r.user_id, r.role]));
+
+    const displayNameForMember = (profile, emailFallback) => {
+      const fn = String(profile?.first_name || '').trim();
+      const ln = String(profile?.last_name || '').trim();
+      const full = `${fn} ${ln}`.trim();
+      if (full) return full;
+      const email = String(emailFallback || '').trim();
+      if (email.includes('@')) return email.split('@')[0];
+      return email || 'Unknown';
+    };
 
     const result = memberships.map((m) => {
       const gr = globalRoleById.get(m.user_id) || 'user';
       const om = orgRoleById.get(m.user_id) ?? null;
+      const profile = profileById.get(m.user_id);
+      const email = profile?.email || 'Unknown';
       return {
         project_id: m.project_id,
         user_id: m.user_id,
         project_role: m.project_role,
-        email: emailById.get(m.user_id) || 'Unknown',
+        email,
+        first_name: profile?.first_name ?? null,
+        last_name: profile?.last_name ?? null,
+        display_name: displayNameForMember(profile, email),
         workspace_role: workspaceRoleFromOrgMember(om, gr),
       };
     });
@@ -1063,13 +1078,13 @@ router.get('/issues/:id/activity-logs', requireOrgContext, async (req, res) => {
       return res.status(404).json({ error: 'Issue not found' });
     }
 
-    const { data: member } = await supabaseAdmin
-      .from('project_members')
-      .select('project_id')
-      .eq('project_id', issue.project_id)
-      .eq('user_id', req.user.id)
-      .maybeSingle();
-    if (!member) {
+    const canSeeProject = await userHasProjectAccess(
+      req.user.id,
+      req.organizationId,
+      issue.project_id,
+      userRole
+    );
+    if (!canSeeProject) {
       return res.status(403).json({ error: 'Access denied to this issue' });
     }
 
