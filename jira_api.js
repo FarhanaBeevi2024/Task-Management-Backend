@@ -1407,20 +1407,37 @@ router.put('/issues/:id', requireOrgContext, async (req, res) => {
       return res.json(issueWithUsers);
     }
     
-    // Team members can update internal_priority and status
-    if (userRole === 'team_member') {
-      const allowedFields = ['status', 'internal_priority', 'workflow_status'];
+    const normalizeAssigneeId = (id) =>
+      id === undefined || id === null || id === '' ? null : String(id);
+
+    const isAssignee = normalizeAssigneeId(currentIssue.assignee_id) === String(req.user.id);
+    const isReporter = normalizeAssigneeId(currentIssue.reporter_id) === String(req.user.id);
+    const canAssignOthers = canAssignIssuesToOthers(userRole);
+
+    // Assignees/reporters without assign-to-others may update their tasks (status, details) but not reassign.
+    if (!canAssignOthers && (isAssignee || isReporter)) {
+      const allowedFields = [
+        'status',
+        'internal_priority',
+        'workflow_status',
+        'summary',
+        'description',
+        'story_points',
+        'labels',
+        'due_date',
+        'estimated_days',
+        'actual_days',
+        'exposed_to_client',
+        'milestone_id',
+        'client_priority',
+      ];
       const updateData = {};
-      allowedFields.forEach(field => {
+      allowedFields.forEach((field) => {
         if (req.body[field] !== undefined) {
           updateData[field] = req.body[field];
         }
       });
 
-      // Can only update if assigned to them or created by them
-      if (currentIssue.assignee_id !== req.user.id && currentIssue.reporter_id !== req.user.id) {
-        return res.status(403).json({ error: 'You can only update issues assigned to you' });
-      }
       await logIssueChanges(supabaseAdmin, req.params.id, currentIssue, updateData, req.user.id);
 
       const { data: issue, error } = await supabaseAdmin
@@ -1434,44 +1451,47 @@ router.put('/issues/:id', requireOrgContext, async (req, res) => {
           issue_type:issue_types(*)
         `)
         .single();
-      
+
       if (error) throw error;
-      
-      // Get user emails
+
       const userIds = [];
       if (issue.assignee_id) userIds.push(issue.assignee_id);
       if (issue.reporter_id) userIds.push(issue.reporter_id);
-      
+
       let profiles = {};
       if (userIds.length > 0) {
         const { data: profilesData } = await supabaseAdmin
           .from('profiles')
           .select('id, email')
           .in('id', userIds);
-        
+
         if (profilesData) {
-          profilesData.forEach(profile => {
+          profilesData.forEach((profile) => {
             profiles[profile.id] = profile;
           });
         }
       }
-      
+
       const issueWithUsers = {
         ...issue,
-        assignee: issue.assignee_id ? profiles[issue.assignee_id] || { id: issue.assignee_id, email: 'Unknown' } : null,
-        reporter: issue.reporter_id ? profiles[issue.reporter_id] || { id: issue.reporter_id, email: 'Unknown' } : null
+        assignee: issue.assignee_id
+          ? profiles[issue.assignee_id] || { id: issue.assignee_id, email: 'Unknown' }
+          : null,
+        reporter: issue.reporter_id
+          ? profiles[issue.reporter_id] || { id: issue.reporter_id, email: 'Unknown' }
+          : null,
       };
-      
+
       return res.json(issueWithUsers);
     }
 
-    // Assigning to someone other than yourself requires canAssignIssuesToOthers
+    // Assigning to someone other than yourself requires canAssignIssuesToOthers (only when assignee changes).
     if (req.body.assignee_id !== undefined) {
-      const next =
-        req.body.assignee_id === '' || req.body.assignee_id === null
-          ? null
-          : String(req.body.assignee_id);
-      if (next && next !== String(req.user.id) && !canAssignIssuesToOthers(userRole)) {
+      const next = normalizeAssigneeId(req.body.assignee_id);
+      const current = normalizeAssigneeId(currentIssue.assignee_id);
+      if (next === current) {
+        delete req.body.assignee_id;
+      } else if (next && next !== String(req.user.id) && !canAssignOthers) {
         return res.status(403).json({ error: 'You do not have permission to assign issues to other users' });
       }
     }
