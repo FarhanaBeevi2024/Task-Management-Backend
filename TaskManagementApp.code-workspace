@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../../Chemplast/TaskManagementApp"
+		},
+		{
+			"path": "../../Chemplast/MobileApp_TaskManagement"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "."
+		}
+	]
+}

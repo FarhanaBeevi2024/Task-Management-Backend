@@ -3,6 +3,7 @@ import express from 'express';
 import { supabaseAdmin } from '../supabaseAdmin.js';
 import { authenticate, loadGlobalRole } from '../middleware/auth.js';
 import { getUserRole } from '../services/authz.js';
+import { canDeleteIssues } from '../accessConfig.js';
 
 const router = express.Router();
 
@@ -146,11 +147,9 @@ router.delete('/tasks/:id', authenticate, loadGlobalRole, async (req, res) => {
     if (taskError) throw taskError;
 
     const userRole = await getUserRole(req.user.id);
-    const isManager = userRole === 'team_leader' || userRole === 'admin' || userRole === 'superadmin';
 
-    // Only creator or manager can delete
-    if (task.created_by !== req.user.id && !isManager) {
-      return res.status(403).json({ error: 'Access denied' });
+    if (!canDeleteIssues(userRole)) {
+      return res.status(403).json({ error: 'You do not have permission to delete tasks' });
     }
 
     const { error } = await supabaseAdmin.from('tasks').delete().eq('id', req.params.id);

@@ -8,6 +8,8 @@ import {
   canManageProjectMembers,
   canManageMilestones,
   canViewAllProjects,
+  canDeleteProjects,
+  canDeleteIssues,
 } from './accessConfig.js';
 import { logActivity, logIssueChanges } from './activityLogger.js';
 import {
@@ -368,7 +370,7 @@ router.put('/projects/:id', requireOrgContext, attachOrgFromProject, requireSame
 router.delete('/projects/:id', requireOrgContext, attachOrgFromProject, requireSameOrganizationForResource, async (req, res) => {
   try {
     const userRole = await getUserRole(req.user.id);
-    if (!(await resolveCanManageProjectMembers(req.user.id, req.params.id, userRole))) {
+    if (!canDeleteProjects(userRole)) {
       return res.status(403).json({ error: 'You do not have permission to delete projects' });
     }
     const projectId = req.params.id;
@@ -1641,7 +1643,7 @@ router.delete('/issues/:id', requireOrgContext, async (req, res) => {
     if (!okProject) {
       return res.status(404).json({ error: 'Issue not found' });
     }
-    if (!(await resolveCanManageProjectMembers(req.user.id, existing.project_id, userRole))) {
+    if (!canDeleteIssues(userRole)) {
       return res.status(403).json({ error: 'You do not have permission to delete issues' });
     }
     await logActivity(supabaseAdmin, {

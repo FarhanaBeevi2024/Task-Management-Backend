@@ -17,6 +17,8 @@ export {
   canCreateIssues,
   canAssignIssuesToOthers,
   canManageMilestones,
+  canDeleteProjects,
+  canDeleteIssues,
   getProjectPermissions,
   getRoleAccessRoles,
 } from './roleAccessStore.js';

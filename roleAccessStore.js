@@ -11,6 +11,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canViewAllUsers: true,
       canCreateProjects: true,
       canViewAllProjects: true,
+      canDeleteProjects: true,
     },
     project: {
       autoMemberOnCreate: true,
@@ -18,6 +19,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canCreateIssues: true,
       canAssignIssuesToOthers: true,
       canManageMilestones: true,
+      canDeleteIssues: true,
     },
   },
   admin: {
@@ -26,6 +28,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canViewAllUsers: true,
       canCreateProjects: true,
       canViewAllProjects: true,
+      canDeleteProjects: true,
     },
     project: {
       autoMemberOnCreate: true,
@@ -33,6 +36,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canCreateIssues: true,
       canAssignIssuesToOthers: true,
       canManageMilestones: true,
+      canDeleteIssues: true,
     },
   },
   team_leader: {
@@ -41,6 +45,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canViewAllUsers: true,
       canCreateProjects: true,
       canViewAllProjects: false,
+      canDeleteProjects: true,
     },
     project: {
       autoMemberOnCreate: true,
@@ -48,6 +53,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canCreateIssues: true,
       canAssignIssuesToOthers: true,
       canManageMilestones: true,
+      canDeleteIssues: true,
     },
   },
   team_member: {
@@ -56,6 +62,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canViewAllUsers: false,
       canCreateProjects: false,
       canViewAllProjects: false,
+      canDeleteProjects: false,
     },
     project: {
       autoMemberOnCreate: false,
@@ -63,6 +70,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canCreateIssues: true,
       canAssignIssuesToOthers: false,
       canManageMilestones: false,
+      canDeleteIssues: false,
     },
   },
   client: {
@@ -71,6 +79,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canViewAllUsers: false,
       canCreateProjects: false,
       canViewAllProjects: false,
+      canDeleteProjects: false,
     },
     project: {
       autoMemberOnCreate: false,
@@ -78,6 +87,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canCreateIssues: false,
       canAssignIssuesToOthers: false,
       canManageMilestones: false,
+      canDeleteIssues: false,
     },
   },
   user: {
@@ -86,6 +96,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canViewAllUsers: false,
       canCreateProjects: false,
       canViewAllProjects: false,
+      canDeleteProjects: false,
     },
     project: {
       autoMemberOnCreate: false,
@@ -93,6 +104,7 @@ export const DEFAULT_ROLE_ACCESS = {
       canCreateIssues: true,
       canAssignIssuesToOthers: false,
       canManageMilestones: false,
+      canDeleteIssues: false,
     },
   },
 };
@@ -111,6 +123,7 @@ const GLOBAL_KEYS = new Set([
   'canViewAllUsers',
   'canCreateProjects',
   'canViewAllProjects',
+  'canDeleteProjects',
 ]);
 
 const PROJECT_KEYS = new Set([
@@ -119,6 +132,7 @@ const PROJECT_KEYS = new Set([
   'canCreateIssues',
   'canAssignIssuesToOthers',
   'canManageMilestones',
+  'canDeleteIssues',
 ]);
 
 const GLOBAL_KEY_LIST = [...GLOBAL_KEYS];
@@ -246,6 +260,16 @@ export function canAssignIssuesToOthers(globalRole) {
 /** Project: can create and edit release milestones */
 export function canManageMilestones(globalRole) {
   return getRoleConfig(globalRole).project?.canManageMilestones === true;
+}
+
+/** Global: can permanently delete projects */
+export function canDeleteProjects(globalRole) {
+  return getRoleConfig(globalRole).global?.canDeleteProjects === true;
+}
+
+/** Project: can delete issues / tasks */
+export function canDeleteIssues(globalRole) {
+  return getRoleConfig(globalRole).project?.canDeleteIssues === true;
 }
 
 /** Get full project permission object */
